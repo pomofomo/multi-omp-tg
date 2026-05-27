@@ -43,6 +43,55 @@ func TestPutGetByAllThreeIndexes(t *testing.T) {
 	}
 }
 
+func TestSessionIDAndDebugRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	// Older rows (no SessionID, no Debug) must decode with zero values.
+	inst := Instance{
+		InstanceID: "legacy",
+		ChatID:     1,
+		TopicID:    1,
+		Secret:     "s",
+		State:      StateRunning,
+	}
+	if err := s.Put(inst); err != nil {
+		t.Fatalf("put legacy: %v", err)
+	}
+	got, _ := s.Get("legacy")
+	if got == nil || got.SessionID != "" || got.Debug {
+		t.Fatalf("legacy row decoded with non-zero new fields: %+v", got)
+	}
+
+	// New rows must round-trip both fields.
+	inst2 := Instance{
+		InstanceID: "newer",
+		ChatID:     1,
+		TopicID:    2,
+		Secret:     "s2",
+		State:      StateRunning,
+		SessionID:  "019e6884-eec4-7000-880a-f1856985a2fd",
+		Debug:      true,
+	}
+	if err := s.Put(inst2); err != nil {
+		t.Fatalf("put newer: %v", err)
+	}
+	got, _ = s.Get("newer")
+	if got == nil {
+		t.Fatal("newer row missing")
+	}
+	if got.SessionID != inst2.SessionID {
+		t.Errorf("SessionID round-trip: got %q want %q", got.SessionID, inst2.SessionID)
+	}
+	if !got.Debug {
+		t.Errorf("Debug round-trip: want true, got false")
+	}
+}
+
 func TestPutUpdatesStaleIndexes(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "test.db"))

@@ -37,9 +37,11 @@ type Instance struct {
 	RepoPath    string    `json:"repo_path"`
 	RepoName    string    `json:"repo_name"`
 	Secret      string    `json:"secret"`
+	SessionID   string    `json:"session_id,omitempty"` // omp session id (captured from first NDJSON line of last run)
 	State       State     `json:"state"`
 	FailCount   int       `json:"fail_count"`
 	Manager     bool      `json:"manager"`
+	Debug       bool      `json:"debug,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

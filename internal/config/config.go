@@ -95,7 +95,7 @@ func ReadRepoConfig(repoPath string) (RepoConfig, error) {
 }
 
 // EnsureGitignore appends TRD-specific entries to <repoPath>/.gitignore if not
-// already present: .trd/, .mcp.json, .omc/. These are per-instance files that
+// already present: .trd/, .omc/. These are per-instance files that
 // should not be committed to the repo.
 func EnsureGitignore(repoPath string) error {
 	path := filepath.Join(repoPath, ".gitignore")
@@ -106,7 +106,6 @@ func EnsureGitignore(repoPath string) error {
 
 	entries := []struct{ pattern, alt string }{
 		{".trd/", ".trd"},
-		{".mcp.json", ""},
 		{".omc/", ".omc"},
 	}
 

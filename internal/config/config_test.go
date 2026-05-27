@@ -48,11 +48,11 @@ func TestEnsureGitignoreAppendsOnce(t *testing.T) {
 	if strings.Count(content, ".trd/") != 1 {
 		t.Errorf("want exactly one .trd/ entry, got:\n%s", content)
 	}
-	if strings.Count(content, ".mcp.json") != 1 {
-		t.Errorf("want exactly one .mcp.json entry, got:\n%s", content)
-	}
 	if strings.Count(content, ".omc/") != 1 {
 		t.Errorf("want exactly one .omc/ entry, got:\n%s", content)
+	}
+	if strings.Contains(content, ".mcp.json") {
+		t.Errorf("post-port gitignore must not mention .mcp.json:\n%s", content)
 	}
 }
 
@@ -66,7 +66,7 @@ func TestEnsureGitignoreCreatesIfMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(data)
-	for _, entry := range []string{".trd/", ".mcp.json", ".omc/"} {
+	for _, entry := range []string{".trd/", ".omc/"} {
 		if !strings.Contains(content, entry) {
 			t.Errorf("gitignore missing %s: %s", entry, content)
 		}
