@@ -55,23 +55,26 @@ Per Telegram message in topic `T` bound to instance `I`:
 ```
 omp -p \
     --mode json \
-    --cwd  <I.RepoPath> \
     [--resume <I.SessionID>]   # omitted on first invocation
-    [--model <cfg.Model>]      # if persisted
-    [--effort <cfg.Effort>]    # if persisted
-    -- "<user message text>"
+    [--model <cfg.Model>]      # if persisted (fuzzy match: "opus", "haiku", …)
+    [--thinking <cfg.Thinking>]# if persisted (minimal, low, medium, high, xhigh)
+    "<user message text>"
 ```
+
+The process is run with `cmd.Dir = I.RepoPath` (omp has no `--cwd` flag —
+the cwd is inherited from the parent).
 
 - **stdin**: closed immediately after spawn (omp -p reads the prompt from
   argv, not stdin).
 - **stdout**: NDJSON, one event per line. The dispatcher only **needs** to
-  surface assistant text deltas to Telegram and capture the session id from
-  the first header line; everything else (tool calls, plan updates) is
-  logged but not forwarded for the initial port.
+  surface assistant text to Telegram and capture the session id from the
+  first `type:"session"` event; everything else (tool calls, plan updates)
+  is logged but not forwarded for the initial port.
 - **stderr**: appended verbatim to `~/.trd/logs/<instance-id>.log`. Surfaced
   by `/watch` and `trd watch`.
-- **exit code**: 0 on success. Non-zero → reply "agent exited <code>; see
-  /watch".
+- **exit code**: 0 on success (including soft errors like API overloaded —
+  omp reports those via `errorMessage` on the assistant message). Non-zero →
+  reply "agent exited <code>; see /watch".
 - **cancellation**: `ctx.Done()` (user-initiated `/cancel`, dispatcher
   shutdown) → `cmd.Process.Signal(os.Interrupt)`, then 5s grace, then
   `cmd.Process.Kill()`.
@@ -198,9 +201,9 @@ Per-command semantics in the subprocess world:
 | `/status` | Report repo path, current session id (8 char), whether a run is in flight. |
 | `/watch` | `tail -n 200` of `~/.trd/logs/<id>.log`, truncated to 4 KB. |
 | `/forget` | Delete bbolt row. Cancel any active run first. |
-| `/debug` | Toggle a setting persisted in bbolt; consulted on every spawn to add `--debug`. |
+| `/debug` | Toggle a setting persisted in bbolt; consulted on every spawn to attach extra logging (`omp` itself has no `--debug` flag; we tee stderr and bump our own slog level). |
 | `/model [name]` | Write `Model` to per-repo config file `<repo>/.trd/agent.json`. Consumed at next spawn as `--model`. Empty arg → show current. |
-| `/effort [level]` | Same as model, for `--effort`. |
+| `/effort [level]` | Same as model, for `--thinking`. Effort levels accepted: `minimal`, `low`, `medium`, `high`, `xhigh`. |
 | `/cancel` | New. SIGINT the in-flight run for this topic. |
 | `/help` | Updated text. |
 
@@ -244,7 +247,7 @@ func (d *Dispatcher) driveAgentRun(ctx, inst, run, prompt) {
         Cwd:       inst.RepoPath,
         SessionID: inst.SessionID,    // "" on first run
         Model:     cfg.Model,
-        Effort:    cfg.Effort,
+        Thinking:  cfg.Thinking,
         Debug:     d.opts.Debug || inst.Debug,
         Prompt:    prompt,
         LogPath:   logPathFor(inst.InstanceID),
@@ -317,8 +320,8 @@ type RunOptions struct {
     Cwd       string
     SessionID string   // "" for new session
     Model     string   // "" → omit flag
-    Effort    string
-    Debug     bool
+    Thinking  string  // "" → omit flag; values: minimal, low, medium, high, xhigh
+    Debug     bool    // toggles extra logging on our side; omp has no --debug flag
     Prompt    string
     LogPath   string   // stderr tee target
     Binary    string   // optional override; default "omp"
@@ -336,12 +339,12 @@ func (r *Run) Cmd() *exec.Cmd       { return r.cmd }
 // is drained by a background goroutine that parses NDJSON from stdout.
 // The channel closes when omp exits (cmd.Wait() returns).
 func Start(ctx context.Context, opts RunOptions) (*Run, error) {
-    args := []string{"-p", "--mode", "json", "--cwd", opts.Cwd}
+    args := []string{"-p", "--mode", "json"}
     if opts.SessionID != "" { args = append(args, "--resume", opts.SessionID) }
     if opts.Model != ""     { args = append(args, "--model", opts.Model) }
-    if opts.Effort != ""    { args = append(args, "--effort", opts.Effort) }
-    if opts.Debug           { args = append(args, "--debug") }
-    args = append(args, "--", opts.Prompt)
+    if opts.Thinking != "" { args = append(args, "--thinking", opts.Thinking) }
+
+    args = append(args, opts.Prompt)
 
     bin := opts.Binary
     if bin == "" { bin = firstNonEmpty(os.Getenv("TRD_OMP_BIN"), "omp") }
@@ -479,7 +482,7 @@ Same for `FailCount` — keep, unused.
 Helpers live in `internal/config/agent_config.go` (new):
 
 ```go
-type AgentConfig struct { Model, Effort, UpdatedAt string }
+type AgentConfig struct { Model, Thinking, UpdatedAt string }
 func ReadAgentConfig(repoPath string) AgentConfig
 func WriteAgentField(repoPath, field, value string) error
 ```
@@ -669,7 +672,53 @@ historical/superseded), `porting/BRIDGE.md` (keep as engineering note).
 
 ---
 
-## Appendix A — omp NDJSON sample (filled by Phase 0)
+## Appendix A — omp NDJSON sample
 
-> Populated when Phase 0 runs `omp -p --mode json --cwd /tmp/x "hi"`.
-> Until then, treat `classify` field names as placeholders.
+Recorded with `omp v15.3.0` running:
+`cd /tmp/omp-probe && omp -p --mode json --no-skills --no-extensions "say hi in 5 words"`
+
+A full 14-line capture lives in `porting/omp-sample.ndjson`. Below is the
+distilled event taxonomy the `agent.classify` function targets.
+
+### Per-line event types observed
+
+| `type` | When emitted | Fields used by the bridge |
+|--------|--------------|---------------------------|
+| `session` | First line of every run | `id` (session UUID), `cwd`, `timestamp`, optional `title` |
+| `agent_start` | Once, after `session` | — |
+| `turn_start` | Once per turn | — |
+| `message_start` | Per message in the turn (user + assistant) | `message.role`, `message.content[].text` |
+| `message_update` | Streaming text chunks | `assistantMessageEvent.type` ∈ {`text_start`, `text_delta`, `text_end`}; `assistantMessageEvent.delta` (incremental); `assistantMessageEvent.content` (cumulative on `text_end`) |
+| `message_end` | Per finalized message | `message.role`, `message.content[].text`, `message.stopReason`, `message.errorMessage` (on API errors) |
+| `turn_end` | Once per turn | `message` (final assistant), `toolResults` |
+| `agent_end` | Final line of the run | `messages[]` (whole conversation) |
+| `auto_retry_start` | Soft API failure → omp retrying | `attempt`, `maxAttempts`, `delayMs`, `errorMessage`. Surface as a status. |
+| `model_change`, `thinking_level_change` | Mid-session config events | not consumed by initial port |
+
+### Bridge mapping (`agent.classify`)
+
+| Source NDJSON | Emitted `agent.Event` |
+|---------------|------------------------|
+| `type:"session"` | `EvSessionID` with `SessionID = id` |
+| `type:"message_update"` with `assistantMessageEvent.type == "text_delta"` | `EvAssistantDelta` with `Text = delta` |
+| `type:"message_end"` with `message.role == "assistant"` and `message.stopReason == "error"` | `EvError` with `Text = message.errorMessage` |
+| `type:"message_end"` with `message.role == "assistant"` and no error | `EvAssistantFinal` with `Text = concat(message.content[].text where type=="text")` |
+| `type:"agent_end"` | `EvDone` |
+| anything else | swallowed (logged at debug) |
+
+### Resume semantics
+
+`omp -p --resume <id>` matches the session id (full UUID or unambiguous
+prefix) **within the cwd's session directory**
+(`~/.omp/agent/sessions/<cwd-mangled>/`). Cross-cwd resume is unsupported.
+The dispatcher MUST always invoke omp with `cmd.Dir = I.RepoPath`.
+
+### Known sharp edge
+
+omp writes session files atomically: while writing, the file is named
+`.<timestamp>_<id>.jsonl.<rand>.tmp`. On a clean dispose the leading `.`
+and trailing `.tmp` are removed. If omp is killed mid-stream (or exits
+during an auto-retry pause), the `.tmp` file remains and **the session is
+not resumable** by id. The dispatcher tolerates this: a failed resume just
+means the next user message starts a new session. Captured by the risk
+register.
