@@ -31,14 +31,12 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# Node / Bun
+# Node / Bun (legacy — no JS in tree anymore, but keep for env clutter)
 node_modules/
 *.log
 
-# TRD build artifacts (keep the JS shim, which is source)
-bin/trd
-bin/trd-darwin-*
-bin/trd-linux-*
+# TRD build artifacts
+bin/
 
 # OMC state
 .omc/

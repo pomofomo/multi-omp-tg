@@ -192,6 +192,6 @@ Roughly prioritized:
 - Delegation between instances via `POST /api/delegate`.
 - Re-add outbound TTS — sentinel marker in assistant text → dispatcher synthesizes and sends voice.
 - Auto-download inbound photos (pre-fetch instead of attachment dance).
-- CI / release automation (GitHub Actions → npm publish).
+- CI / release automation (GitHub Actions → tagged releases with prebuilt binaries per host arch).
 - Branch-aware topics (git worktrees).
 - Remote instances via SSH.
