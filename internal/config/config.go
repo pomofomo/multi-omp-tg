@@ -1,20 +1,17 @@
-// Package config handles paths and the per-repo .trd/config.json identity file.
+// Package config handles paths and per-repo state under ~/.trd/ and
+// <repo>/.trd/. The per-repo files split into:
+//
+//   <repo>/.trd/agent.json — model/thinking overrides (agent_config.go)
+//
+// There used to be a <repo>/.trd/config.json carrying the WS secret and
+// dispatcher port for the channel plugin; that file is obsolete now that
+// `omp -p` is invoked directly per Telegram message.
 package config
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 )
-
-// RepoConfig is written to <repo>/.trd/config.json on first clone.
-// The channel plugin reads it to learn its identity and dispatcher address.
-type RepoConfig struct {
-	InstanceID     string `json:"instance_id"`
-	Secret         string `json:"secret"`
-	DispatcherPort int    `json:"dispatcher_port"`
-}
 
 // Root returns ~/.trd/.
 func Root() (string, error) {
@@ -43,6 +40,24 @@ func LogPath() (string, error) {
 	return filepath.Join(r, "trd.log"), nil
 }
 
+// LogsDir returns ~/.trd/logs/ for per-instance agent stderr logs.
+func LogsDir() (string, error) {
+	r, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(r, "logs"), nil
+}
+
+// InstanceLogPath returns ~/.trd/logs/<instance-id>.log.
+func InstanceLogPath(instanceID string) (string, error) {
+	dir, err := LogsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, instanceID+".log"), nil
+}
+
 // ReposDir returns ~/.trd/repos/.
 func ReposDir() (string, error) {
 	r, err := Root()
@@ -52,7 +67,7 @@ func ReposDir() (string, error) {
 	return filepath.Join(r, "repos"), nil
 }
 
-// EnsureRoot creates ~/.trd/ and ~/.trd/repos/ if missing.
+// EnsureRoot creates ~/.trd/, ~/.trd/repos/, and ~/.trd/logs/ if missing.
 func EnsureRoot() error {
 	r, err := Root()
 	if err != nil {
@@ -61,38 +76,13 @@ func EnsureRoot() error {
 	if err := os.MkdirAll(filepath.Join(r, "repos"), 0o700); err != nil {
 		return err
 	}
-	return nil
-}
-
-// WriteRepoConfig writes <repoPath>/.trd/config.json with 0600 mode.
-func WriteRepoConfig(repoPath string, cfg RepoConfig) error {
-	dir := filepath.Join(repoPath, ".trd")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Join(r, "logs"), 0o700); err != nil {
 		return err
 	}
 	return nil
 }
 
-// ReadRepoConfig loads <repoPath>/.trd/config.json.
-func ReadRepoConfig(repoPath string) (RepoConfig, error) {
-	var cfg RepoConfig
-	data, err := os.ReadFile(filepath.Join(repoPath, ".trd", "config.json"))
-	if err != nil {
-		return cfg, err
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return cfg, fmt.Errorf("parse config: %w", err)
-	}
-	return cfg, nil
-}
+
 
 // EnsureGitignore appends TRD-specific entries to <repoPath>/.gitignore if not
 // already present: .trd/, .omc/. These are per-instance files that

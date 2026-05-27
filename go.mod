@@ -3,7 +3,6 @@ module github.com/pomofomo/multi-claude-tg
 go 1.23
 
 require (
-	github.com/coder/websocket v1.8.14
 	github.com/google/uuid v1.6.0
 	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3
 	github.com/k2-fsa/sherpa-onnx-go v1.12.38

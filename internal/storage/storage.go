@@ -133,8 +133,13 @@ func (s *Store) Put(inst Instance) error {
 		if err := byTopic.Put(topicKey(inst.ChatID, inst.TopicID), []byte(inst.InstanceID)); err != nil {
 			return err
 		}
-		if err := bySecret.Put([]byte(inst.Secret), []byte(inst.InstanceID)); err != nil {
-			return err
+		// Secret is unused after the headless-omp port (no WS auth). Older
+		// rows may still carry one; we keep the index for those, but a
+		// blank Secret on a fresh row is permitted and bypasses the index.
+		if inst.Secret != "" {
+			if err := bySecret.Put([]byte(inst.Secret), []byte(inst.InstanceID)); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

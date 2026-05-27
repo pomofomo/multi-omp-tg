@@ -7,29 +7,7 @@ import (
 	"testing"
 )
 
-func TestWriteReadRepoConfig(t *testing.T) {
-	dir := t.TempDir()
-	in := RepoConfig{InstanceID: "i", Secret: "s", DispatcherPort: 7777}
-	if err := WriteRepoConfig(dir, in); err != nil {
-		t.Fatal(err)
-	}
-	out, err := ReadRepoConfig(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out != in {
-		t.Errorf("round-trip mismatch: %+v vs %+v", out, in)
-	}
 
-	// mode must be 0600
-	info, err := os.Stat(filepath.Join(dir, ".trd", "config.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Errorf("want perm 0600, got %o", info.Mode().Perm())
-	}
-}
 
 func TestEnsureGitignoreAppendsOnce(t *testing.T) {
 	dir := t.TempDir()
