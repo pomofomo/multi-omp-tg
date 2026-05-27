@@ -44,3 +44,5 @@ bin/trd-linux-*
 .omc/
 .trd/
 .claude/
+
+.cache

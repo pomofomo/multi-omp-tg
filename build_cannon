@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# build_cannon — concatenate the repository's tracked text files into a single
+# document for feeding into an LLM context window.
+#
+# Usage: ./build_cannon [output_path]
+#   default output_path: .cache/cannon.txt
+#
+# Selection rules:
+#   - Uses `git ls-files` so .gitignore is honored automatically (including
+#     untracked-but-not-ignored files via --others --exclude-standard).
+#   - Skips binary files (detected via NUL byte in the first 8 KiB).
+#   - Skips the output file itself if it lives inside the repo.
+
+set -euo pipefail
+
+out="${1:-.claude/skills/cannon/SKILL.md}"
+mkdir -p "$(dirname "$out")"
+cat > "$out" << EOF
+---                                                                          
+name: cannon 
+description: Loads full codebase dump into context
+disable-model-invocation: true
+---     
+
+Here is the entire codebase of this repo, do not use the search tool for any files. Do search the text below in your context to answer any question on this codebase.
+
+EOF
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# Absolute path of output, so we can exclude it from the listing.
+out_abs="$(readlink -f -- "$out" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$out")"
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+{
+    printf '# Cannon: codebase dump generated %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '# Repo: %s\n' "$repo_root"
+    printf '# Commit: %s\n' "$(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
+    printf '\n'
+} > "$tmp"
+
+count=0
+skipped_binary=0
+skipped_missing=0
+
+# Tracked + untracked-but-not-ignored, NUL-delimited for safety on weird names.
+while IFS= read -r -d '' f; do
+    [ -f "$f" ] || { skipped_missing=$((skipped_missing+1)); continue; }
+
+    f_abs="$(readlink -f -- "$f" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$f")"
+    [ "$f_abs" = "$out_abs" ] && continue
+
+    # Binary sniff: any NUL byte in first 8 KiB → skip.
+    if LC_ALL=C grep -qI . -- "$f" 2>/dev/null; then
+        :
+    else
+        skipped_binary=$((skipped_binary+1))
+        continue
+    fi
+
+    {
+        printf '\n==== FILE: %s ====\n' "$f"
+        cat -- "$f"
+        printf '\n'
+    } >> "$tmp"
+    count=$((count+1))
+done < <(git ls-files -z --cached --others --exclude-standard)
+
+cat -- "$tmp" >> "$out"
+trap - EXIT
+
+bytes="$(wc -c < "$tmp")"
+lines="$(wc -l < "$tmp")"
+printf 'Wrote %s (%s files, %s lines, %s bytes); skipped %s binary, %s missing\n' \
+    "$out" "$count" "$lines" "$bytes" "$skipped_binary" "$skipped_missing"
