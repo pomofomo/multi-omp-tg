@@ -407,6 +407,57 @@ func TestErrorEventSurfacesAsTelegramMessage(t *testing.T) {
 	}
 }
 
+func TestPostFinalErrorDoesNotPolluteReply(t *testing.T) {
+	// omp commonly emits a tail-end EPIPE / truncated-JSON EvError when
+	// its stdout is torn down after the canonical message_end. The
+	// dispatcher must surface the clean final reply unchanged and only
+	// log the post-final error for forensics.
+	r := &fakeRunner{emit: []agent.Event{
+		{Kind: agent.EvAssistantFinal, Text: "clean final reply"},
+		{Kind: agent.EvError, Text: "agent: bad json line: {\"type\":\"agent_end\","},
+	}}
+	d, rec := newTestDispatcher(t, r)
+
+	inst := storage.Instance{InstanceID: "ipostfinal", ChatID: 1, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 1, text: "x"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+
+	waitFor(t, 2*time.Second, func() bool { return len(rec.sentTexts()) >= 1 })
+
+	texts := rec.sentTexts()
+	if texts[0] != "clean final reply" {
+		t.Errorf("reply must be the canonical final text, untouched; got %q", texts[0])
+	}
+	if contains(texts[0], "agent reported") || contains(texts[0], "bad json") {
+		t.Errorf("post-final EvError must not leak into the reply; got %q", texts[0])
+	}
+}
+
+func TestErrorBeforeFinalStillSurfaces(t *testing.T) {
+	// Regression guard: the suppression must NOT swallow errors that
+	// arrived before any final message. Those are real failures and the
+	// user needs to see them.
+	r := &fakeRunner{emit: []agent.Event{
+		{Kind: agent.EvError, Text: "overloaded_error: rate limit"},
+	}}
+	d, rec := newTestDispatcher(t, r)
+
+	inst := storage.Instance{InstanceID: "iprefinal", ChatID: 1, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 1, text: "x"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+
+	waitFor(t, 2*time.Second, func() bool { return len(rec.sentTexts()) >= 1 })
+	if !contains(rec.sentTexts()[0], "agent error") {
+		t.Errorf("pre-final EvError must still surface; got %q", rec.sentTexts()[0])
+	}
+}
+
 func TestExtensionWiringPropagatedToAgent(t *testing.T) {
 	r := &fakeRunner{emit: []agent.Event{{Kind: agent.EvAssistantFinal, Text: "ok"}}}
 	d, _ := newTestDispatcher(t, r)

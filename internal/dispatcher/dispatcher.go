@@ -1096,6 +1096,18 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 			assistantBuf.WriteString(ev.Text)
 			sawFinal = true
 		case agent.EvError:
+			if sawFinal {
+				// omp already produced its canonical message_end; the only
+				// EvError we see now is its stdout teardown noise (EPIPE,
+				// truncated agent_end frame). Log it for forensics but do
+				// NOT flip hadError — the reply is already correct and we
+				// must not append "(agent reported: …)" to a successful
+				// turn. See DEBUG.md § "EPIPE on agent_end polluting clean
+				// replies".
+				d.logger.Warn("agent error event (post_final, suppressed from reply)",
+					"instance", shortID(inst.InstanceID), "text", ev.Text)
+				continue
+			}
 			hadError = true
 			errText = ev.Text
 			d.logger.Warn("agent error event",

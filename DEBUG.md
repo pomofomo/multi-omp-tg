@@ -12,10 +12,11 @@ doesn't have to re-derive it.
 | You see… | Look at… |
 |---|---|
 | Bot is silent | `tmux attach -t trd` — is the dispatcher even running? |
-| Reply has `(agent reported: …)` appended | An `EvError` arrived from `omp`. Check `~/.trd/logs/<instance-id>.log`. |
-| `EPIPE` in the per-instance log | `omp` lost its stdout pipe mid-write. Almost always because `trd` was killed (SIGINT in tmux, restart, crash). |
-| `agent: bad json line:` warnings in `trd.log` | `omp` emitted partial NDJSON (same root cause as EPIPE). Now suppressed when a final reply was already received. |
-| No 👍 reaction after sending a message | The dispatcher couldn't reach Telegram's `setMessageReaction` endpoint. `trd start --debug` and look for `"reaction failed"`. |
+| Reply has `(agent reported: …)` appended | A pre-final `EvError` from `omp`. Check `~/.trd/logs/<instance-id>.log`. (Post-final EvErrors are suppressed — see § 1.) |
+| `EPIPE` in the per-instance log | `omp` lost its stdout pipe mid-write. Almost always because `trd` was killed (SIGINT in tmux, restart, crash) or the run completed and `omp`'s final `agent_end` frame raced the pipe close. Harmless when a clean reply already shipped. |
+| `agent: bad json line:` warnings in `trd.log` | `omp` emitted partial NDJSON (same root cause as EPIPE). When tagged `post_final, suppressed from reply` it is informational only. |
+| 👀 lands but no 👍 follows | Dispatcher routed the message but the LLM never called `tg_react("👍")`. Most likely cause: an old `omp` invocation that predates the extension wiring (check `ps` for `--extension` on the omp argv). |
+| Neither 👀 nor 👍 | Dispatcher couldn't reach Telegram's `setMessageReaction`. `trd start --debug` and look for `"reaction failed"`. |
 | Run hangs forever | `RunTimeout` is 15 min. After that the context kills `omp`. To kill sooner: `/cancel` in the topic, or `POST /api/instances/{id}/cancel`. |
 | Session won't resume | A killed run can leave a `.tmp` session file in `~/.omp/agent/sessions/`. `/reset` in the topic clears `Instance.SessionID`; next message starts fresh. |
 
@@ -68,14 +69,19 @@ dispatcher had already received `EvAssistantFinal` and built a clean reply
 from `message_end`, but the post-final error flipped `hadError`, and the
 trailing branch in `driveAgentRun` appended `(agent reported: …)`.
 
-**Fix.** Two-part, both in `internal/dispatcher/dispatcher.go`:
+**Fix.** In `internal/dispatcher/dispatcher.go`'s `driveAgentRun`, an
+`EvError` arriving *after* `sawFinal=true` is logged at WARN with a
+`(post_final, suppressed from reply)` marker but does **not** flip
+`hadError`. The run already succeeded; do not pollute the reply with a
+post-success diagnostic.
 
-1. `driveAgentRun`: `EvError` arriving *after* `sawFinal=true` is logged
-   (`post_final=true`) but does **not** flip `hadError`. The run already
-   succeeded; do not pollute the reply with a post-success diagnostic.
-2. `routeToInstance`: send `👍` via `sendReaction` *before* `buildPrompt`,
-   so the user sees acknowledgement even when transcription/download is
-   slow. Queued messages still get `👀` (overrides `👍`) from `enqueueOrRun`.
+Errors that arrive *before* the final message still flip `hadError`
+normally — pre-final failures are real failures and the user needs to see
+them. `TestErrorBeforeFinalStillSurfaces` guards that path; the new
+`TestPostFinalErrorDoesNotPolluteReply` guards the suppression.
+
+The closely related visibility-mark question (👀 vs 👍, who fires what)
+is handled separately under § 2 below.
 
 **Lessons.**
 
@@ -102,13 +108,30 @@ message. The headless port removed the MCP plugin (deliberately — see
 `ARCHITECTURE.md` "Lost vs gained") but did not move the acknowledgement
 into the dispatcher.
 
-**Fix.** Acknowledge in the dispatcher (`routeToInstance`). The dispatcher
-already owns every outbound Telegram call in the headless model; the agent
-doesn't need to know about Telegram at all.
+**Fix — two-mark visibility chain.** Acknowledgement is split across the
+two layers that have the relevant information, so the sender can see
+exactly where the request is in the pipeline:
+
+| Mark | Set by | When | Meaning |
+|------|--------|------|---------|
+| 👀 | Dispatcher in `enqueueOrRun` (deterministic) | Within ~ms of routing the Telegram update, before `omp -p` is spawned | "system received it" |
+| 👍 | LLM via the `tg_react` tool, per the `SystemPromptAppend` ACKNOWLEDGE pattern | First action of the turn, before any other tool calls or text | "model has seen it" |
+
+The 👀 fires for every prompt — idle path and queue-behind-busy path
+both. The 👍 fires from the agent itself via the in-process omp extension
+(`internal/agent/extension/tg.ts`), which POSTs `/api/tg/react` on the
+dispatcher's localhost control plane. The bot token never leaves the
+dispatcher process.
+
+If 👀 appears but 👍 never does, the dispatcher routed the message but
+the agent failed to act on it — useful diagnostic. The LLM MAY also
+upgrade the reaction later in the turn (🎉 / 😅 / ❌) to reflect outcome.
 
 **Lesson.** When you remove a layer, walk every promise that layer made to
 the user. Some are visible enough to migrate explicitly; the rest become
-silent regressions.
+silent regressions. Where the visibility itself is the user's signal of
+progress, split the mark across whichever layers can actually observe
+each stage — one mark per stage beats one mark from one layer.
 
 ## The restart-self problem
 
