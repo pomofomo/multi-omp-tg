@@ -18,33 +18,36 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pomofomo/multi-claude-tg/internal/config"
-	"github.com/pomofomo/multi-claude-tg/internal/dispatcher"
-	"github.com/pomofomo/multi-claude-tg/internal/storage"
-	"github.com/pomofomo/multi-claude-tg/internal/tmuxmgr"
+	"github.com/pomofomo/multi-omp-tg/internal/config"
+	"github.com/pomofomo/multi-omp-tg/internal/dispatcher"
+	"github.com/pomofomo/multi-omp-tg/internal/storage"
+
 )
 
-const usage = `trd — Telegram Repo Dispatcher
+const usage = `trd — Telegram Repo Dispatcher (headless omp)
 
 Usage:
-  trd start --telegram-token <token> [--port 7777]
-  trd status
-  trd list
-  trd stop    <name-or-prefix>
-  trd watch   <name-or-prefix>
-  trd shell   <name-or-prefix>
-  trd cd      <name-or-prefix>
-  trd allow   <username>
-  trd deny    <username>
-  trd allowed
+  trd start --telegram-token <token> [--port 7777] [--debug] [--omp-bin <path>]
+  trd status                      show all instances
+  trd list                        alias for status
+  trd stop    <name-or-prefix>    cancel any in-flight agent run
+  trd watch   <name-or-prefix>    print the agent log for that instance
+  trd shell   <name-or-prefix>    open a shell in the instance's repo
+  trd cd      <name-or-prefix>    print the instance's repo path
+  trd allow   <username>          add a Telegram username to the allowlist
+  trd deny    <username>          remove a Telegram username from the allowlist
+  trd allowed                     print the allowlist
 
 <name-or-prefix> matches against repo name first, then instance ID prefix.
 
 Env:
-  TELEGRAM_BOT_TOKEN      default for --telegram-token
+  TELEGRAM_BOT_TOKEN      default for --telegram-token (persisted to bbolt)
   TRD_PORT                default for --port (7777)
-  TRD_HEALTH_INTERVAL_SEC health-loop interval (default 30)
+  TRD_DEBUG               default for --debug ("1" → enabled)
+  TRD_OMP_BIN             default omp binary (defaults to "omp" on PATH)
   TRD_ALLOWED_USERNAMES   comma-separated allowlist (merged with stored list)
+  TRD_WHISPER_MODEL_DIR   directory containing whisper models for STT
+  TRD_TTS_MODEL_DIR       directory containing VITS models for TTS
 `
 
 func main() {
@@ -87,9 +90,9 @@ var persistedEnvKeys = []string{
 	"TELEGRAM_BOT_TOKEN",
 	"TRD_WHISPER_MODEL_DIR",
 	"TRD_TTS_MODEL_DIR",
-	"TRD_CHANNEL_ENTRY",
 	"TRD_OPENAI_API_KEY",
 	"TRD_ALLOWED_USERNAMES",
+	"TRD_OMP_BIN",
 }
 
 // loadSavedSettings opens the DB, and for each persisted key where the env
@@ -121,8 +124,9 @@ func cmdStart(args []string) {
 
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	token := fs.String("telegram-token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
-	port := fs.Int("port", envInt("TRD_PORT", 7777), "dispatcher HTTP/WS port")
-	debug := fs.Bool("debug", os.Getenv("TRD_DEBUG") == "1", "enable debug logging and pass --debug to Claude instances")
+	port := fs.Int("port", envInt("TRD_PORT", 7777), "dispatcher HTTP API port")
+	debug := fs.Bool("debug", os.Getenv("TRD_DEBUG") == "1", "enable verbose dispatcher logging")
+	ompBin := fs.String("omp-bin", os.Getenv("TRD_OMP_BIN"), "path to omp binary (default: omp on PATH)")
 	_ = fs.Parse(args)
 	if *token == "" {
 		fmt.Fprintln(os.Stderr, "--telegram-token is required (or set TELEGRAM_BOT_TOKEN)")
@@ -131,11 +135,11 @@ func cmdStart(args []string) {
 
 	logger := newLogger(*debug)
 	d, err := dispatcher.New(dispatcher.Options{
-		TelegramToken:  *token,
-		Port:           *port,
-		Logger:         logger,
-		Debug:          *debug,
-		HealthInterval: time.Duration(envInt("TRD_HEALTH_INTERVAL_SEC", 30)) * time.Second,
+		TelegramToken: *token,
+		Port:          *port,
+		Logger:        logger,
+		Debug:         *debug,
+		OMPBinary:     *ompBin,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start failed:", err)
@@ -160,8 +164,10 @@ func cmdStart(args []string) {
 // instanceInfo mirrors dispatcher.InstanceInfo for decoding the API response.
 type instanceInfo struct {
 	storage.Instance
-	Connected bool `json:"connected"`
-	TmuxAlive bool `json:"tmux_alive"`
+	// Running is set by the dispatcher when an omp -p run is in flight
+	// for this instance. Older API responses sent `connected`/`tmux_alive`;
+	// those keys are ignored after the headless port.
+	Running bool `json:"running"`
 }
 
 // allInstances tries the running dispatcher's HTTP API first, then falls back
@@ -213,18 +219,19 @@ func cmdStatus(args []string) {
 		return
 	}
 	for _, inst := range all {
-		alive := inst.TmuxAlive
-		if !alive {
-			// Fallback for direct-DB path where TmuxAlive isn't populated.
-			alive = tmuxmgr.HasSession(tmuxmgr.SessionName(inst.InstanceID))
-		}
 		name := inst.RepoName
 		if name == "" {
 			name = storage.RepoNameFromURL(inst.RepoURL)
 		}
-		fmt.Printf("%-20s %s  %s  state=%-8s tmux=%v  channel=%v  %s\n",
+		session := inst.SessionID
+		if session == "" {
+			session = "-"
+		} else if len(session) > 8 {
+			session = session[:8]
+		}
+		fmt.Printf("%-20s %s  %s  state=%-8s session=%s  running=%v  %s\n",
 			name, inst.InstanceID[:8], shortTime(inst.CreatedAt),
-			inst.State, alive, inst.Connected, inst.RepoURL)
+			inst.State, session, inst.Running, inst.RepoURL)
 	}
 }
 
@@ -268,20 +275,29 @@ func cmdCd(args []string) {
 
 func cmdStop(args []string) {
 	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: trd stop <instance-prefix>")
+		fmt.Fprintln(os.Stderr, "usage: trd stop <name-or-prefix>")
 		os.Exit(2)
 	}
-	prefix := args[0]
-	inst, err := findInstance(prefix)
+	inst, err := findInstance(args[0])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := tmuxmgr.KillSession(tmuxmgr.SessionName(inst.InstanceID)); err != nil {
-		fmt.Fprintln(os.Stderr, "kill:", err)
+	port := envInt("TRD_PORT", 7777)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/instances/%s/cancel", port, inst.InstanceID)
+	req, _ := http.NewRequest(http.MethodPost, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cancel via dispatcher:", err)
 		os.Exit(1)
 	}
-	fmt.Println("stopped", inst.InstanceID[:8])
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "cancel failed: %s\n%s\n", resp.Status, body)
+		os.Exit(1)
+	}
+	fmt.Println("cancel requested for", inst.InstanceID[:8])
 }
 
 func cmdWatch(args []string) {
@@ -294,12 +310,21 @@ func cmdWatch(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	out, err := tmuxmgr.CapturePane(tmuxmgr.SessionName(inst.InstanceID))
+	logPath, err := config.InstanceLogPath(inst.InstanceID)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "capture-pane:", err)
+		fmt.Fprintln(os.Stderr, "log path:", err)
 		os.Exit(1)
 	}
-	_, _ = io.Copy(os.Stdout, strings.NewReader(out))
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, "no log yet — send a message in the topic to spawn the agent.")
+			return
+		}
+		fmt.Fprintln(os.Stderr, "read log:", err)
+		os.Exit(1)
+	}
+	_, _ = io.Copy(os.Stdout, strings.NewReader(string(data)))
 }
 
 func cmdAllow(args []string) {

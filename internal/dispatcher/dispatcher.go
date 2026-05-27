@@ -1,11 +1,24 @@
-// Package dispatcher is the heart of TRD: it owns the Telegram long-poll,
-// the WS server, the process manager, and the pub/sub between them.
+// Package dispatcher is the heart of TRD in its headless-omp incarnation:
+// it owns the Telegram long-poll, the small HTTP control plane, and a
+// per-instance FIFO of one-shot `omp -p` invocations.
+//
+// Lifecycle of a Telegram message arriving in a topic bound to instance I:
+//
+//   1. routeToInstance      pulls I from bbolt, builds the prompt
+//                           (text + voice transcript + attachment notes).
+//   2. enqueueOrRun         either spawns omp immediately (no run in flight)
+//                           or appends to per-instance pendingQueue.
+//   3. driveAgentRun        agent.Start → range events → forward to Telegram.
+//   4. finishRun            cleans up; drains the next queued prompt if any.
+//
+// There is no persistent agent. There is no WebSocket. There is no tmux.
+// Everything the dispatcher remembers across messages lives in bbolt:
+//   - Instance.SessionID — omp session UUID, used as `--resume` next turn.
+//   - Allowlist, persistent settings — same as before.
 package dispatcher
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,12 +32,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/pomofomo/multi-claude-tg/internal/config"
-	"github.com/pomofomo/multi-claude-tg/internal/media"
-	"github.com/pomofomo/multi-claude-tg/internal/storage"
-	"github.com/pomofomo/multi-claude-tg/internal/telegram"
-	"github.com/pomofomo/multi-claude-tg/internal/tmuxmgr"
-	"github.com/pomofomo/multi-claude-tg/internal/ws"
+	"github.com/pomofomo/multi-omp-tg/internal/agent"
+	"github.com/pomofomo/multi-omp-tg/internal/api"
+	"github.com/pomofomo/multi-omp-tg/internal/config"
+	"github.com/pomofomo/multi-omp-tg/internal/media"
+	"github.com/pomofomo/multi-omp-tg/internal/storage"
+	"github.com/pomofomo/multi-omp-tg/internal/telegram"
 )
 
 // Options for Run.
@@ -32,13 +45,47 @@ type Options struct {
 	TelegramToken string
 	Port          int
 	Logger        *slog.Logger
-	// HealthInterval is how often the health loop wakes up. 0 = 30s default.
-	HealthInterval time.Duration
 	// AttachDir is where downloaded Telegram attachments are written.
 	// Defaults to ~/.trd/attachments.
 	AttachDir string
-	// Debug enables verbose logging and passes --debug to Claude instances.
+	// Debug toggles verbose logging on the dispatcher side. omp itself has
+	// no --debug flag in print mode; the value is still surfaced to event
+	// logging and recorded per-instance via /debug.
 	Debug bool
+	// OMPBinary overrides the omp executable path. Empty falls back to
+	// $TRD_OMP_BIN then "omp" on PATH.
+	OMPBinary string
+	// RunTimeout caps how long a single agent run may take before the
+	// dispatcher SIGINTs it. 0 → 15 minutes.
+	RunTimeout time.Duration
+	// runner is a test seam for swapping out the agent.Start function.
+	// Production callers leave this nil; tests set it to a fake.
+	runner runner
+}
+
+// runner is the minimal abstraction we need over agent.Start so tests can
+// substitute an in-process fake. Exposed only to the test file via
+// Options.runner.
+type runner interface {
+	Start(ctx context.Context, opts agent.RunOptions) (agentHandle, error)
+}
+
+// agentHandle is the slice of *agent.Run the dispatcher uses. The real
+// *agent.Run satisfies it; tests provide their own implementation.
+type agentHandle interface {
+	Events() <-chan agent.Event
+	Cancel(grace time.Duration)
+}
+
+// defaultRunner wraps agent.Start.
+type defaultRunner struct{}
+
+func (defaultRunner) Start(ctx context.Context, opts agent.RunOptions) (agentHandle, error) {
+	r, err := agent.Start(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // Dispatcher glues the subsystems together.
@@ -47,54 +94,67 @@ type Dispatcher struct {
 	logger *slog.Logger
 	tg     *telegram.Client
 	store  *storage.Store
-	server *ws.Server
+	api    *api.Server
 	media  *media.Engine
+	runner runner
 
-	// live WS conns keyed by instance_id.
-	mu    sync.RWMutex
-	conns map[string]*liveConn
+	// sendMessage and setReaction are function-field test seams over the
+	// telegram client. New() defaults them to d.tg.SendMessage and
+	// d.tg.SetReaction; tests substitute fakes to verify routing without
+	// hitting the wire.
+	sendMessage func(ctx context.Context, p telegram.SendMessageParams) (telegram.Message, error)
+	setReaction func(ctx context.Context, chatID int64, msgID int, emoji string) error
 
-	// pending download responses, keyed by (instance_id+req_id) -> callback chan.
-	pendingMu sync.Mutex
-	pending   map[string]chan ws.Frame
-
-	// rateLimited tracks instances that hit Claude's rate limit, so we
-	// only notify once and can detect recovery.
-	rateLimitedMu sync.Mutex
-	rateLimited   map[string]bool
-
-	// pendingDelegates tracks delegate requests waiting for a reply from
-	// the target instance. Keyed by target instance_id.
-	delegateMu       sync.Mutex
-	pendingDelegates map[string]chan string
+	// In-flight agent runs and per-instance pending queues. The dispatcher
+	// serialises invocations per instance: a topic always sees its agent's
+	// reply to message N before message N+1 is sent.
+	runMu        sync.Mutex
+	runs         map[string]*agentRun
+	pendingQueue map[string][]queuedPrompt
 }
 
-type liveConn struct {
-	conn    *ws.Conn
-	inbound chan ws.Frame // dispatcher -> plugin
+// agentRun is the live handle for an `omp -p` invocation. Created by
+// driveAgentRun, accessed under runMu.
+type agentRun struct {
+	instanceID string
+	handle     agentHandle
+	cancel     context.CancelFunc
+	chatID     int64
+	thread     int
+	msgID      int // telegram message id this run is responding to
+	started    time.Time
 }
 
-// InstanceInfo is the enriched instance data returned by the API, adding
-// runtime state (WS connection, tmux liveness) to the stored Instance.
+// queuedPrompt holds the data needed to invoke omp for a message that
+// arrived while another run was in flight on the same instance.
+type queuedPrompt struct {
+	chatID int64
+	thread int
+	msgID  int
+	user   string
+	text   string
+}
+
+// InstanceInfo is the JSON shape returned by GET /api/instances. It adds
+// runtime state (whether a run is currently in flight) to the stored row.
 type InstanceInfo struct {
 	storage.Instance
-	Connected bool `json:"connected"`
-	TmuxAlive bool `json:"tmux_alive"`
+	Running bool `json:"running"`
 }
 
-// New builds a Dispatcher, opening the DB and constructing the WS server.
+// New builds a Dispatcher, opening the DB and constructing the API server.
 func New(opts Options) (*Dispatcher, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
-	}
-	if opts.HealthInterval == 0 {
-		opts.HealthInterval = 30 * time.Second
 	}
 	if opts.Port == 0 {
 		opts.Port = 7777
 	}
 	if opts.TelegramToken == "" {
 		return nil, errors.New("telegram token is required")
+	}
+	if opts.RunTimeout == 0 {
+		opts.RunTimeout = 15 * time.Minute
 	}
 
 	if err := config.EnsureRoot(); err != nil {
@@ -113,6 +173,7 @@ func New(opts Options) (*Dispatcher, error) {
 		opts.AttachDir = filepath.Join(root, "attachments")
 	}
 	if err := os.MkdirAll(opts.AttachDir, 0o700); err != nil {
+		store.Close()
 		return nil, err
 	}
 
@@ -122,18 +183,25 @@ func New(opts Options) (*Dispatcher, error) {
 		store.Close()
 		return nil, fmt.Errorf("init media: %w", err)
 	}
-	d := &Dispatcher{
-		opts:    opts,
-		logger:  opts.Logger,
-		tg:      telegram.New(opts.TelegramToken),
-		store:   store,
-		media:   engine,
-		conns:            map[string]*liveConn{},
-		pending:          map[string]chan ws.Frame{},
-		rateLimited:      map[string]bool{},
-		pendingDelegates: map[string]chan string{},
+
+	r := opts.runner
+	if r == nil {
+		r = defaultRunner{}
 	}
-	d.server = ws.New(fmt.Sprintf("127.0.0.1:%d", opts.Port), opts.Logger, d)
+
+	d := &Dispatcher{
+		opts:         opts,
+		logger:       opts.Logger,
+		tg:           telegram.New(opts.TelegramToken),
+		store:        store,
+		media:        engine,
+		runner:       r,
+		runs:         map[string]*agentRun{},
+		pendingQueue: map[string][]queuedPrompt{},
+	}
+	d.sendMessage = d.tg.SendMessage
+	d.setReaction = d.tg.SetReaction
+	d.api = api.New(fmt.Sprintf("127.0.0.1:%d", opts.Port), opts.Logger, d)
 	return d, nil
 }
 
@@ -143,326 +211,56 @@ func (d *Dispatcher) Close() error {
 	return d.store.Close()
 }
 
-// --- ws.Handler implementation ---
-
-// AuthSecret looks up an instance by secret.
-func (d *Dispatcher) AuthSecret(secret string) (string, int64, int, bool) {
-	inst, err := d.store.BySecret(secret)
-	if err != nil || inst == nil {
-		return "", 0, 0, false
-	}
-	return inst.InstanceID, inst.ChatID, inst.TopicID, true
-}
-
-// Register binds a WS conn to an instance. Returns a channel the writer should drain.
-func (d *Dispatcher) Register(instanceID string, conn *ws.Conn) <-chan ws.Frame {
-	ch := make(chan ws.Frame, 64)
-	d.mu.Lock()
-	// If there's an existing conn, close its channel first.
-	if old, ok := d.conns[instanceID]; ok {
-		close(old.inbound)
-	}
-	d.conns[instanceID] = &liveConn{conn: conn, inbound: ch}
-	d.mu.Unlock()
-	d.logger.Info("channel connected", "instance", instanceID)
-	// Tell the channel plugin whether this instance is a manager.
-	inst, _ := d.store.Get(instanceID)
-	if inst != nil && inst.Manager {
-		ch <- ws.Frame{Type: "config", Manager: true}
-	}
-	return ch
-}
-
-// Unregister removes the binding if it still points at conn.
-func (d *Dispatcher) Unregister(instanceID string, conn *ws.Conn) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if live, ok := d.conns[instanceID]; ok && live.conn == conn {
-		close(live.inbound)
-		delete(d.conns, instanceID)
-		d.logger.Info("channel disconnected", "instance", instanceID)
-	}
-}
-
-// OnOutbound handles a plugin->server frame.
-func (d *Dispatcher) OnOutbound(instanceID string, frame ws.Frame) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	switch frame.Type {
-	case "reply":
-		inst, _ := d.store.Get(instanceID)
-		if inst == nil {
-			d.logger.Warn("reply for unknown instance", "instance", instanceID)
-			return
-		}
-		chatID := inst.ChatID
-		threadID := inst.TopicID
-		d.logger.Info("claude->tg reply",
-			"instance", shortID(instanceID),
-			"chat", chatID, "thread", threadID,
-			"reply_to", frame.ReplyTo,
-			"text_len", len(frame.Text), "text", preview(frame.Text),
-			"files", len(frame.Files),
-		)
-		// If a manager is waiting for a delegate response from this instance,
-		// forward the reply text to the waiting channel.
-		d.delegateMu.Lock()
-		if ch, ok := d.pendingDelegates[instanceID]; ok {
-			select {
-			case ch <- frame.Text:
-			default:
-			}
-			delete(d.pendingDelegates, instanceID)
-		}
-		d.delegateMu.Unlock()
-
-		if frame.Text != "" {
-			// Telegram has a 4096 char limit. Split long messages.
-			for i, chunk := range splitMessage(frame.Text, 4000) {
-				replyTo := 0
-				if i == 0 {
-					replyTo = frame.ReplyTo
-				}
-				sent, err := d.tg.SendMessage(ctx, telegram.SendMessageParams{
-					ChatID:           chatID,
-					MessageThreadID:  threadID,
-					Text:             chunk,
-					ReplyToMessageID: replyTo,
-				})
-				if err != nil {
-					d.logger.Warn("tg sendMessage failed", "instance", shortID(instanceID), "err", err, "chunk", i)
-				} else {
-					d.logger.Info("tg sendMessage ok", "instance", shortID(instanceID), "msg_id", sent.MessageID, "chunk", i)
-				}
-			}
-		}
-		for _, path := range frame.Files {
-			if err := d.sendFileSmartly(ctx, chatID, threadID, path, instanceID); err != nil {
-				d.logger.Warn("tg send file failed", "instance", shortID(instanceID), "path", path, "err", err)
-			}
-		}
-	case "delegate":
-		d.handleDelegate(instanceID, frame)
-	case "react":
-		d.logger.Info("claude->tg react",
-			"instance", shortID(instanceID),
-			"chat", frame.ChatID, "msg_id", frame.MessageID, "emoji", frame.Emoji,
-		)
-		if err := d.tg.SetReaction(ctx, frame.ChatID, frame.MessageID, frame.Emoji); err != nil {
-			d.logger.Warn("tg setReaction failed", "instance", shortID(instanceID), "err", err)
-		}
-	case "edit":
-		d.logger.Info("claude->tg edit",
-			"instance", shortID(instanceID),
-			"chat", frame.ChatID, "msg_id", frame.MessageID,
-			"text_len", len(frame.Text), "text", preview(frame.Text),
-		)
-		if err := d.tg.EditMessageText(ctx, telegram.EditMessageTextParams{
-			ChatID:    frame.ChatID,
-			MessageID: frame.MessageID,
-			Text:      frame.Text,
-		}); err != nil {
-			d.logger.Warn("tg editMessageText failed", "instance", shortID(instanceID), "err", err)
-		}
-	case "download":
-		d.logger.Info("claude->tg download",
-			"instance", shortID(instanceID), "file_id", frame.FileID, "req_id", frame.ReqID,
-		)
-		path, err := d.tg.DownloadFile(ctx, frame.FileID, d.opts.AttachDir)
-		resp := ws.Frame{Type: "download_result", ReqID: frame.ReqID, Path: path}
-		if err != nil {
-			resp.Err = err.Error()
-			d.logger.Warn("tg downloadFile failed", "instance", shortID(instanceID), "err", err)
-		} else {
-			d.logger.Info("tg downloadFile ok", "instance", shortID(instanceID), "path", path)
-		}
-		d.sendTo(instanceID, resp)
-	case "tts":
-		d.logger.Info("claude->tg tts",
-			"instance", shortID(instanceID), "text_len", len(frame.Text),
-		)
-		inst, _ := d.store.Get(instanceID)
-		if inst == nil {
-			d.logger.Warn("tts for unknown instance", "instance", instanceID)
-			d.sendTo(instanceID, ws.Frame{Type: "tts_result", ReqID: frame.ReqID, Err: "unknown instance"})
-			return
-		}
-		if !d.media.CanSynthesize() {
-			errMsg := "TTS not configured. Set TRD_TTS_CMD (e.g. kokoro) or TRD_OPENAI_API_KEY."
-			d.logger.Warn("tts not configured", "instance", shortID(instanceID))
-			d.sendTo(instanceID, ws.Frame{Type: "tts_result", ReqID: frame.ReqID, Err: errMsg})
-			return
-		}
-		audioPath, err := d.media.Synthesize(ctx, frame.Text, d.opts.AttachDir)
-		if err != nil {
-			d.logger.Warn("tts synthesis failed", "instance", shortID(instanceID), "err", err)
-			d.sendTo(instanceID, ws.Frame{Type: "tts_result", ReqID: frame.ReqID, Err: err.Error()})
-			return
-		}
-		if _, err := d.tg.SendVoice(ctx, inst.ChatID, inst.TopicID, audioPath, ""); err != nil {
-			d.logger.Warn("tg sendVoice failed", "instance", shortID(instanceID), "err", err)
-			d.sendTo(instanceID, ws.Frame{Type: "tts_result", ReqID: frame.ReqID, Err: err.Error()})
-		} else {
-			d.logger.Info("tg sendVoice ok", "instance", shortID(instanceID), "path", audioPath)
-			d.sendTo(instanceID, ws.Frame{Type: "tts_result", ReqID: frame.ReqID, Path: audioPath})
-		}
-	case "hello":
-		d.logger.Info("channel hello", "instance", shortID(instanceID), "claims", shortID(frame.InstanceID))
-	default:
-		d.logger.Warn("unknown frame type", "instance", shortID(instanceID), "type", frame.Type)
-	}
-}
-
-// sendTo pushes a frame to the given instance's WS writer channel. Drops if no conn.
-func (d *Dispatcher) sendTo(instanceID string, frame ws.Frame) {
-	d.mu.RLock()
-	live, ok := d.conns[instanceID]
-	d.mu.RUnlock()
-	if !ok {
-		d.logger.Warn("no live channel — dropping frame (claude session not connected?)",
-			"instance", shortID(instanceID), "frame_type", frame.Type,
-		)
-		return
-	}
-	select {
-	case live.inbound <- frame:
-		d.logger.Debug("frame queued to channel",
-			"instance", shortID(instanceID), "frame_type", frame.Type,
-			"queue_depth", len(live.inbound),
-		)
-	default:
-		d.logger.Warn("inbound channel full — dropping frame",
-			"instance", shortID(instanceID), "frame_type", frame.Type,
-		)
-	}
-}
+// --- api.Handler implementation ---
 
 // ListInstances returns all instances as JSON for the CLI API endpoint,
-// enriched with runtime WS connection and tmux liveness state.
+// enriched with whether a run is currently in flight.
 func (d *Dispatcher) ListInstances() ([]byte, error) {
 	all, err := d.store.All()
 	if err != nil {
 		return nil, err
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.runMu.Lock()
+	defer d.runMu.Unlock()
 	infos := make([]InstanceInfo, len(all))
 	for i, inst := range all {
-		_, connected := d.conns[inst.InstanceID]
-		infos[i] = InstanceInfo{
-			Instance:  inst,
-			Connected: connected,
-			TmuxAlive: tmuxmgr.HasSession(tmuxmgr.SessionName(inst.InstanceID)),
-		}
+		_, running := d.runs[inst.InstanceID]
+		infos[i] = InstanceInfo{Instance: inst, Running: running}
 	}
 	return json.Marshal(infos)
 }
 
-// handleDelegate processes a delegate frame from a manager instance. It finds
-// the target instance, injects the message, waits for a reply, and sends the
-// result back to the manager.
-func (d *Dispatcher) handleDelegate(managerID string, frame ws.Frame) {
-	d.logger.Info("delegate",
-		"manager", shortID(managerID), "target", frame.Target,
-		"text_len", len(frame.Text), "req_id", frame.ReqID,
-	)
+// AllowedUsers returns the stored allowlist.
+func (d *Dispatcher) AllowedUsers() ([]string, error) { return d.store.ListAllowedUsers() }
 
-	// Resolve target instance by name or ID prefix.
-	target, err := d.findInstance(frame.Target)
-	if err != nil {
-		d.sendTo(managerID, ws.Frame{
-			Type: "delegate_result", ReqID: frame.ReqID,
-			Err: "target not found: " + err.Error(),
-		})
-		return
-	}
-
-	// Check target is running and connected.
-	d.mu.RLock()
-	_, connected := d.conns[target.InstanceID]
-	d.mu.RUnlock()
-	if !connected {
-		d.sendTo(managerID, ws.Frame{
-			Type: "delegate_result", ReqID: frame.ReqID,
-			Err: fmt.Sprintf("target %q not connected (channel=%v)", target.RepoName, false),
-		})
-		return
-	}
-
-	// Set up a channel to receive the reply.
-	replyCh := make(chan string, 1)
-	d.delegateMu.Lock()
-	d.pendingDelegates[target.InstanceID] = replyCh
-	d.delegateMu.Unlock()
-
-	// Post the task to the target's Telegram topic for visibility.
-	managerInst, _ := d.store.Get(managerID)
-	managerName := "manager"
-	if managerInst != nil {
-		managerName = managerInst.RepoName
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	d.sendText(ctx, target.ChatID, target.TopicID,
-		fmt.Sprintf("📋 [%s]: %s", managerName, frame.Text))
-
-	// Inject the message into the target's WS channel.
-	d.sendTo(target.InstanceID, ws.Frame{
-		Type:   "message",
-		ChatID: target.ChatID,
-		User:   "manager:" + managerName,
-		Text:   frame.Text,
-	})
-
-	// Wait for the reply or timeout.
-	select {
-	case reply := <-replyCh:
-		d.sendTo(managerID, ws.Frame{
-			Type:  "delegate_result",
-			ReqID: frame.ReqID,
-			Text:  reply,
-		})
-	case <-ctx.Done():
-		d.delegateMu.Lock()
-		delete(d.pendingDelegates, target.InstanceID)
-		d.delegateMu.Unlock()
-		d.sendTo(managerID, ws.Frame{
-			Type: "delegate_result", ReqID: frame.ReqID,
-			Err: "delegate timed out (5m)",
-		})
-	}
+// AddAllowedUser adds a username to the stored allowlist.
+func (d *Dispatcher) AddAllowedUser(username string) error {
+	return d.store.AddAllowedUser(username)
 }
 
-// findInstance resolves an instance by repo name or ID prefix.
-func (d *Dispatcher) findInstance(query string) (*storage.Instance, error) {
-	all, err := d.store.All()
+// RemoveAllowedUser removes a username from the stored allowlist.
+func (d *Dispatcher) RemoveAllowedUser(username string) error {
+	return d.store.RemoveAllowedUser(username)
+}
+
+// CancelRun aborts any in-flight agent run matching the given instance id
+// or repo-name/id prefix. Returns nil when there is nothing to cancel —
+// the CLI caller's expectation is "best-effort stop", not "must be running".
+func (d *Dispatcher) CancelRun(query string) error {
+	inst, err := d.findInstance(query)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	// Match by repo name first.
-	var byName []storage.Instance
-	for _, inst := range all {
-		name := inst.RepoName
-		if name == "" {
-			name = storage.RepoNameFromURL(inst.RepoURL)
-		}
-		if strings.EqualFold(name, query) || strings.HasPrefix(strings.ToLower(name), strings.ToLower(query)) {
-			byName = append(byName, inst)
-		}
+	d.runMu.Lock()
+	run, ok := d.runs[inst.InstanceID]
+	d.runMu.Unlock()
+	if !ok {
+		return nil
 	}
-	if len(byName) == 1 {
-		return &byName[0], nil
-	}
-	if len(byName) > 1 {
-		return nil, fmt.Errorf("%d instances match %q", len(byName), query)
-	}
-	// Match by ID prefix.
-	for _, inst := range all {
-		if strings.HasPrefix(inst.InstanceID, query) {
-			return &inst, nil
-		}
-	}
-	return nil, fmt.Errorf("no instance matching %q", query)
+	d.logger.Info("cancel run", "instance", shortID(inst.InstanceID))
+	run.cancel()
+	run.handle.Cancel(5 * time.Second)
+	return nil
 }
 
 // isUserAllowed checks a Telegram username against the combined allowlist
@@ -483,14 +281,12 @@ func (d *Dispatcher) isUserAllowed(username string) bool {
 				return true
 			}
 		}
-		// Env is set — also check stored list before rejecting.
 		if d.store.IsAllowedUser(username) {
 			return true
 		}
 		return false
 	}
 
-	// No env var — check stored list. Empty list = allow all.
 	stored, _ := d.store.ListAllowedUsers()
 	if len(stored) == 0 {
 		return true
@@ -511,37 +307,15 @@ func (d *Dispatcher) SaveSettings(keys []string) {
 	}
 }
 
-// AllowedUsers returns the stored allowlist.
-func (d *Dispatcher) AllowedUsers() ([]string, error) { return d.store.ListAllowedUsers() }
-
-// AddAllowedUser adds a username to the stored allowlist.
-func (d *Dispatcher) AddAllowedUser(username string) error { return d.store.AddAllowedUser(username) }
-
-// RemoveAllowedUser removes a username from the stored allowlist.
-func (d *Dispatcher) RemoveAllowedUser(username string) error {
-	return d.store.RemoveAllowedUser(username)
-}
-
 // --- Telegram long-poll and command handling ---
 
-// Run starts the WS server and Telegram long-poll. Blocks until ctx is canceled.
+// Run starts the HTTP API and Telegram long-poll. Blocks until ctx is canceled.
 func (d *Dispatcher) Run(ctx context.Context) error {
-	// 1. Relaunch any running/stopped instances that have a tmux session expected.
-	if err := d.resumeInstances(); err != nil {
-		d.logger.Warn("resume instances", "err", err)
-	}
-
-	// 2. Start WS server.
 	go func() {
-		if err := d.server.ListenAndServe(ctx); err != nil {
-			d.logger.Error("ws server", "err", err)
+		if err := d.api.ListenAndServe(ctx); err != nil {
+			d.logger.Error("api server", "err", err)
 		}
 	}()
-
-	// 3. Start health loop.
-	go d.healthLoop(ctx)
-
-	// 4. Long-poll Telegram.
 	return d.pollLoop(ctx)
 }
 
@@ -552,18 +326,17 @@ func (d *Dispatcher) pollLoop(ctx context.Context) error {
 	}
 	d.logger.Info("telegram bot online", "username", me.Username)
 
-	// Register bot commands for Telegram autocomplete.
 	if err := d.tg.SetMyCommands(ctx, []telegram.BotCommand{
-		{Command: "start", Description: "Clone a repo and launch Claude: /start <git-url>"},
-		{Command: "stop", Description: "Kill the Claude session (mapping kept)"},
-		{Command: "restart", Description: "Resume previous conversation"},
-		{Command: "reset", Description: "Start a fresh conversation"},
-		{Command: "status", Description: "Show tmux + channel connection state"},
-		{Command: "watch", Description: "Capture the current tmux pane"},
-		{Command: "manager", Description: "Toggle manager mode (delegate to other instances)"},
-		{Command: "model", Description: "Show or change model (sonnet, opus, haiku)"},
-		{Command: "effort", Description: "Show or change effort (low, medium, high, xhigh, max, auto)"},
-		{Command: "debug", Description: "Toggle debug mode for new instances"},
+		{Command: "start", Description: "Clone a repo and bind it to this topic: /start <git-url>"},
+		{Command: "stop", Description: "Cancel the in-flight agent run and mark the instance stopped"},
+		{Command: "restart", Description: "Re-enable the instance after /stop"},
+		{Command: "reset", Description: "Forget the session id; next message starts fresh"},
+		{Command: "status", Description: "Show instance, session, and run state"},
+		{Command: "watch", Description: "Tail recent agent log output for this topic"},
+		{Command: "model", Description: "Show or change model (e.g. /model opus)"},
+		{Command: "effort", Description: "Show or change thinking level (minimal, low, medium, high, xhigh)"},
+		{Command: "debug", Description: "Toggle dispatcher debug logging"},
+		{Command: "cancel", Description: "Interrupt the in-flight agent run for this topic"},
 		{Command: "forget", Description: "Delete the topic-repo mapping"},
 		{Command: "help", Description: "Show available commands"},
 	}); err != nil {
@@ -590,9 +363,6 @@ func (d *Dispatcher) pollLoop(ctx context.Context) error {
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
 			}
-			// Log the exact payload Telegram delivered, so we can tell the
-			// difference between "bot never got it" (privacy mode) and "we
-			// parsed it but ignored it" (wrong update type / filter).
 			d.logger.Info("tg raw update", "update_id", u.UpdateID, "raw", string(raws[i]))
 			if u.Message != nil {
 				d.handleMessage(ctx, u.Message)
@@ -616,15 +386,12 @@ func (d *Dispatcher) handleMessage(ctx context.Context, m *telegram.Message) {
 	if rawText == "" {
 		rawText = m.Caption
 	}
-	hasDoc := m.Document != nil
-	nPhotos := len(m.Photo)
-	hasVoice := m.Voice != nil
-	hasAudio := m.Audio != nil
 	d.logger.Info("tg recv",
 		"chat", m.Chat.ID, "chat_type", m.Chat.Type, "is_forum", m.Chat.IsForum,
 		"thread", m.MessageThreadID, "msg_id", m.MessageID,
 		"from", user, "text_len", len(rawText), "text", preview(rawText),
-		"has_doc", hasDoc, "photos", nPhotos, "voice", hasVoice, "audio", hasAudio,
+		"has_doc", m.Document != nil, "photos", len(m.Photo),
+		"voice", m.Voice != nil, "audio", m.Audio != nil,
 	)
 	if m.Chat.Type != "supergroup" || !m.Chat.IsForum {
 		d.logger.Info("tg recv rejected: not forum supergroup", "chat", m.Chat.ID, "chat_type", m.Chat.Type)
@@ -637,7 +404,7 @@ func (d *Dispatcher) handleMessage(ctx context.Context, m *telegram.Message) {
 	}
 	text := strings.TrimSpace(rawText)
 
-	// Strip bot mentions like "@mybot" from slash commands: "/start@mybot foo" -> "/start foo"
+	// Strip bot mentions like "@mybot" from slash commands.
 	if strings.HasPrefix(text, "/") {
 		if idx := strings.Index(text, " "); idx > 0 {
 			cmd := text[:idx]
@@ -673,8 +440,8 @@ func (d *Dispatcher) handleMessage(ctx context.Context, m *telegram.Message) {
 		d.cmdDebug(ctx, m)
 	case text == "/help":
 		d.cmdHelp(ctx, m)
-	case text == "/manager":
-		d.cmdManager(ctx, m)
+	case text == "/cancel":
+		d.cmdCancel(ctx, m)
 	case text == "/model" || strings.HasPrefix(text, "/model "):
 		d.cmdModel(ctx, m, strings.TrimSpace(strings.TrimPrefix(text, "/model")))
 	case text == "/effort" || strings.HasPrefix(text, "/effort "):
@@ -704,27 +471,24 @@ func (d *Dispatcher) cmdStart(ctx context.Context, m *telegram.Message, repoURL 
 	}
 	if existing != nil {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			fmt.Sprintf("This topic is already bound to %s (state=%s). Use /stop first.", existing.RepoURL, existing.State))
+			fmt.Sprintf("This topic is already bound to %s (state=%s). Use /forget first.", existing.RepoURL, existing.State))
+		return
+	}
+
+	// Verify omp is reachable on PATH (or under the override) so we can
+	// fail fast at /start time instead of on the first user message.
+	bin := d.ompBinary()
+	if _, err := exec.LookPath(bin); err != nil {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
+			fmt.Sprintf("%q not found on PATH. Install omp first (https://github.com/oh-my-pi/oh-my-pi).", bin))
 		return
 	}
 
 	instID := uuid.NewString()
-	secret, err := randomHex(32)
-	if err != nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed to generate secret: "+err.Error())
-		return
-	}
-	claudeBin := firstNonEmpty(os.Getenv("TRD_CLAUDE_BIN"), "claude")
-	if _, err := exec.LookPath(claudeBin); err != nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			fmt.Sprintf("%q not found on PATH. Install Claude Code first.", claudeBin))
-		return
-	}
-
 	reposDir, _ := config.ReposDir()
 	repoPath := filepath.Join(reposDir, instID)
 
-	sent, _ := d.tg.SendMessage(ctx, telegram.SendMessageParams{
+	sent, _ := d.sendMessage(ctx, telegram.SendMessageParams{
 		ChatID:          m.Chat.ID,
 		MessageThreadID: m.MessageThreadID,
 		Text:            "Cloning " + repoURL + "…",
@@ -739,7 +503,6 @@ func (d *Dispatcher) cmdStart(ctx context.Context, m *telegram.Message, repoURL 
 		close(cloneDone)
 	}()
 
-	// Update progress message every 10s while clone runs.
 	if sent.MessageID != 0 {
 		start := time.Now()
 		ticker := time.NewTicker(10 * time.Second)
@@ -769,19 +532,7 @@ func (d *Dispatcher) cmdStart(ctx context.Context, m *telegram.Message, repoURL 
 		return
 	}
 
-	cfg := config.RepoConfig{
-		InstanceID:     instID,
-		Secret:         secret,
-		DispatcherPort: d.opts.Port,
-	}
-	if err := config.WriteRepoConfig(repoPath, cfg); err != nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed to write config: "+err.Error())
-		return
-	}
 	_ = config.EnsureGitignore(repoPath)
-	if err := writeMCPConfig(repoPath); err != nil {
-		d.logger.Warn("write .mcp.json", "err", err)
-	}
 
 	inst := storage.Instance{
 		InstanceID: instID,
@@ -790,22 +541,14 @@ func (d *Dispatcher) cmdStart(ctx context.Context, m *telegram.Message, repoURL 
 		RepoURL:    repoURL,
 		RepoPath:   repoPath,
 		RepoName:   storage.RepoNameFromURL(repoURL),
-		Secret:     secret,
 		State:      storage.StateRunning,
 	}
 	if err := d.store.Put(inst); err != nil {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed to persist: "+err.Error())
 		return
 	}
-
-	if err := d.launchTmuxFresh(inst); err != nil {
-		inst.State = storage.StateFailed
-		_ = d.store.Put(inst)
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed to launch tmux: "+err.Error())
-		return
-	}
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-		fmt.Sprintf("Ready. Instance %s running in tmux session %s.", instID[:8], tmuxmgr.SessionName(instID)))
+		fmt.Sprintf("Ready. Instance %s bound. Send a message to start the agent.", instID[:8]))
 }
 
 func (d *Dispatcher) cmdStop(ctx context.Context, m *telegram.Message) {
@@ -814,13 +557,10 @@ func (d *Dispatcher) cmdStop(ctx context.Context, m *telegram.Message) {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	if err := tmuxmgr.KillSession(tmuxmgr.SessionName(inst.InstanceID)); err != nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "kill failed: "+err.Error())
-		return
-	}
+	_ = d.CancelRun(inst.InstanceID)
 	inst.State = storage.StateStopped
 	_ = d.store.Put(*inst)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "stopped")
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Stopped. Use /restart to allow new messages, /reset to forget the session, or /forget to drop the mapping.")
 }
 
 func (d *Dispatcher) cmdRestart(ctx context.Context, m *telegram.Message) {
@@ -829,17 +569,10 @@ func (d *Dispatcher) cmdRestart(ctx context.Context, m *telegram.Message) {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	_ = tmuxmgr.KillSession(tmuxmgr.SessionName(inst.InstanceID))
-	if err := d.launchTmux(*inst); err != nil {
-		inst.State = storage.StateFailed
-		_ = d.store.Put(*inst)
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "restart failed: "+err.Error())
-		return
-	}
 	inst.State = storage.StateRunning
 	inst.FailCount = 0
 	_ = d.store.Put(*inst)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "restarted (conversation resumed)")
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Ready. The next message will resume the existing session.")
 }
 
 func (d *Dispatcher) cmdReset(ctx context.Context, m *telegram.Message) {
@@ -848,54 +581,44 @@ func (d *Dispatcher) cmdReset(ctx context.Context, m *telegram.Message) {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	_ = tmuxmgr.KillSession(tmuxmgr.SessionName(inst.InstanceID))
-	if err := d.launchTmuxFresh(*inst); err != nil {
-		inst.State = storage.StateFailed
-		_ = d.store.Put(*inst)
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "reset failed: "+err.Error())
-		return
-	}
+	_ = d.CancelRun(inst.InstanceID)
+	inst.SessionID = ""
 	inst.State = storage.StateRunning
 	inst.FailCount = 0
 	_ = d.store.Put(*inst)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "reset — fresh conversation started")
-}
-
-func (d *Dispatcher) cmdManager(ctx context.Context, m *telegram.Message) {
-	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
-	if inst == nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
-		return
-	}
-	inst.Manager = !inst.Manager
-	_ = d.store.Put(*inst)
-	state := "OFF"
-	if inst.Manager {
-		state = "ON"
-	}
-	d.logger.Info("manager mode toggled", "instance", shortID(inst.InstanceID), "manager", inst.Manager)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-		fmt.Sprintf("Manager mode: %s. Use /restart to reload with delegate tools.", state))
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Reset — the next message will start a fresh agent session.")
 }
 
 func (d *Dispatcher) cmdHelp(ctx context.Context, m *telegram.Message) {
-	help := `TRD — Telegram Repo Dispatcher
+	help := `TRD — Telegram Repo Dispatcher (omp headless mode)
 
-/start <git-url> — Clone a repo and launch Claude
-/stop — Kill the Claude session (mapping kept)
-/restart — Resume previous conversation
-/reset — Start a fresh conversation (clears history)
-/status — Show tmux + channel connection state
-/watch — Capture the current tmux pane
-/model [name] — Show or change Claude model (sonnet, opus, haiku)
-/effort [level] — Show or change effort (low, medium, high, xhigh, max, auto)
-/manager — Toggle manager mode (enables delegate tools)
-/debug — Toggle debug mode for new instances
+/start <git-url> — Clone a repo and bind it to this topic
+/stop — Cancel any in-flight run; reject new messages until /restart
+/restart — Re-enable the instance after /stop
+/reset — Forget the session id; next message starts fresh
+/status — Show instance, session, and run state
+/watch — Tail recent agent log output for this topic
+/model [name] — Show or change the model (e.g. /model opus)
+/effort [level] — Show or change thinking level (minimal, low, medium, high, xhigh)
+/cancel — Interrupt the in-flight agent run for this topic
+/debug — Toggle dispatcher debug logging
 /forget — Delete the topic-repo mapping
 /help — Show this message
 
-Anything else you type is forwarded to Claude.`
+Anything else you type spawns omp -p in the bound repo.`
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, help)
+}
+
+var validModels = map[string]bool{
+	// Loose whitelist for the most common fuzzy-match aliases. omp will
+	// further resolve the value at spawn time.
+	"opus": true, "sonnet": true, "haiku": true,
+	"gpt-5": true, "gpt-5.1": true, "gpt-5.2": true,
+	"claude-opus-4-7": true, "claude-sonnet-4-5": true,
+}
+
+var validThinking = map[string]bool{
+	"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true,
 }
 
 func (d *Dispatcher) cmdModel(ctx context.Context, m *telegram.Message, arg string) {
@@ -904,29 +627,36 @@ func (d *Dispatcher) cmdModel(ctx context.Context, m *telegram.Message, arg stri
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	name := tmuxmgr.SessionName(inst.InstanceID)
-	if !tmuxmgr.HasSession(name) {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "tmux session not running")
-		return
-	}
+	cfg, _ := config.ReadAgentConfig(inst.RepoPath)
 	if arg == "" {
-		_ = tmuxmgr.SendKeys(name, "/model", "Enter")
-		time.Sleep(1 * time.Second)
-		out, _ := tmuxmgr.CapturePane(name)
+		current := cfg.Model
+		if current == "" {
+			current = "(omp default)"
+		}
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			extractPaneSection(out, "model")+"\n\nOptions: /model sonnet, /model opus, /model haiku")
+			fmt.Sprintf("Current model: %s\nUsage: /model <name>  (e.g. opus, sonnet, haiku, gpt-5.2)\n/model -  resets to omp's default.", current))
 		return
 	}
-	valid := map[string]bool{"sonnet": true, "opus": true, "haiku": true}
-	if !valid[strings.ToLower(arg)] {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			"Unknown model. Options: sonnet, opus, haiku")
+	if arg == "-" {
+		if err := config.WriteAgentField(inst.RepoPath, "model", ""); err != nil {
+			d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed: "+err.Error())
+			return
+		}
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Model cleared — omp will use its own default on the next message.")
 		return
 	}
-	_ = tmuxmgr.SendKeys(name, "/model "+strings.ToLower(arg), "Enter")
-	time.Sleep(1 * time.Second)
-	out, _ := tmuxmgr.CapturePane(name)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, extractPaneSection(out, "model"))
+	// Light validation: warn but still accept anything containing letters
+	// so omp's fuzzy match (e.g. "anthropic/claude-opus-4-7") keeps working.
+	if !validModels[strings.ToLower(arg)] && !looksLikeModelName(arg) {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "That doesn't look like a model name. Try opus, sonnet, haiku, gpt-5.2, …")
+		return
+	}
+	if err := config.WriteAgentField(inst.RepoPath, "model", arg); err != nil {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed: "+err.Error())
+		return
+	}
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
+		fmt.Sprintf("Model set to %q. Takes effect on the next message.", arg))
 }
 
 func (d *Dispatcher) cmdEffort(ctx context.Context, m *telegram.Message, arg string) {
@@ -935,124 +665,35 @@ func (d *Dispatcher) cmdEffort(ctx context.Context, m *telegram.Message, arg str
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	name := tmuxmgr.SessionName(inst.InstanceID)
-	if !tmuxmgr.HasSession(name) {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "tmux session not running")
-		return
-	}
+	cfg, _ := config.ReadAgentConfig(inst.RepoPath)
 	if arg == "" {
-		_ = tmuxmgr.SendKeys(name, "/effort", "Enter")
-		time.Sleep(1 * time.Second)
-		out, _ := tmuxmgr.CapturePane(name)
+		current := cfg.Thinking
+		if current == "" {
+			current = "(omp default)"
+		}
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			extractPaneSection(out, "effort")+"\n\nOptions: /effort low, /effort medium, /effort high, /effort max, /effort auto")
+			fmt.Sprintf("Current thinking level: %s\nOptions: minimal, low, medium, high, xhigh.\n/effort -  resets to omp's default.", current))
 		return
 	}
-	valid := map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true, "auto": true}
-	if !valid[strings.ToLower(arg)] {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			"Unknown effort level. Options: low, medium, high, xhigh, max, auto")
+	if arg == "-" {
+		if err := config.WriteAgentField(inst.RepoPath, "thinking", ""); err != nil {
+			d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed: "+err.Error())
+			return
+		}
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Thinking level cleared — omp will use its own default.")
 		return
 	}
-	_ = tmuxmgr.SendKeys(name, "/effort "+strings.ToLower(arg), "Enter")
-	time.Sleep(1 * time.Second)
-	out, _ := tmuxmgr.CapturePane(name)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, extractPaneSection(out, "effort"))
-}
-
-// splitMessage breaks a long text into chunks of at most maxLen characters,
-// splitting at newline boundaries when possible.
-func splitMessage(text string, maxLen int) []string {
-	if len(text) <= maxLen {
-		return []string{text}
+	low := strings.ToLower(arg)
+	if !validThinking[low] {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Unknown thinking level. Options: minimal, low, medium, high, xhigh.")
+		return
 	}
-	var chunks []string
-	for len(text) > 0 {
-		if len(text) <= maxLen {
-			chunks = append(chunks, text)
-			break
-		}
-		// Find the last newline within maxLen.
-		cut := maxLen
-		if idx := strings.LastIndex(text[:maxLen], "\n"); idx > maxLen/2 {
-			cut = idx + 1
-		}
-		chunks = append(chunks, text[:cut])
-		text = text[cut:]
+	if err := config.WriteAgentField(inst.RepoPath, "thinking", low); err != nil {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "failed: "+err.Error())
+		return
 	}
-	return chunks
-}
-
-// extractPaneSection extracts a meaningful section from a tmux pane capture.
-// For /model output: everything from "select model" up to the first blank line after.
-// For /effort output: everything up to "debug mode".
-// Falls back to content below the last ─── divider, then the full pane.
-func extractPaneSection(pane, hint string) string {
-	lines := strings.Split(pane, "\n")
-	lower := strings.ToLower(hint)
-
-	if lower == "model" {
-		// Find "select model" and grab until next blank line.
-		start := -1
-		for i, line := range lines {
-			if strings.Contains(strings.ToLower(line), "select model") {
-				start = i
-				break
-			}
-		}
-		if start >= 0 {
-			var result []string
-			for _, line := range lines[start:] {
-				trimmed := strings.TrimSpace(line)
-				if len(result) > 0 && trimmed == "" {
-					break
-				}
-				result = append(result, trimmed)
-			}
-			if len(result) > 0 {
-				return strings.Join(result, "\n")
-			}
-		}
-	}
-
-	if lower == "effort" {
-		// Grab content and cut at "debug mode".
-		var result []string
-		capture := false
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if strings.Contains(strings.ToLower(trimmed), "effort") && !capture {
-				capture = true
-			}
-			if capture {
-				if strings.Contains(strings.ToLower(trimmed), "debug mode") {
-					break
-				}
-				if trimmed != "" {
-					result = append(result, trimmed)
-				}
-			}
-		}
-		if len(result) > 0 {
-			return strings.Join(result, "\n")
-		}
-	}
-
-	// Fallback: content below last divider.
-	lastDiv := -1
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if len(trimmed) > 3 && strings.Count(trimmed, "─") > len(trimmed)/2 {
-			lastDiv = i
-		}
-	}
-	if lastDiv >= 0 && lastDiv < len(lines)-1 {
-		result := strings.TrimSpace(strings.Join(lines[lastDiv+1:], "\n"))
-		if result != "" {
-			return result
-		}
-	}
-	return strings.TrimSpace(pane)
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
+		fmt.Sprintf("Thinking level set to %s. Takes effect on the next message.", low))
 }
 
 func (d *Dispatcher) cmdDebug(ctx context.Context, m *telegram.Message) {
@@ -1063,8 +704,7 @@ func (d *Dispatcher) cmdDebug(ctx context.Context, m *telegram.Message) {
 	}
 	d.logger.Info("debug mode toggled", "debug", d.opts.Debug)
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-		fmt.Sprintf("Debug mode: %s. New/restarted Claude instances will %s --debug flag.",
-			state, map[bool]string{true: "include", false: "omit"}[d.opts.Debug]))
+		fmt.Sprintf("Debug mode: %s.", state))
 }
 
 func (d *Dispatcher) cmdStatus(ctx context.Context, m *telegram.Message) {
@@ -1073,13 +713,33 @@ func (d *Dispatcher) cmdStatus(ctx context.Context, m *telegram.Message) {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	alive := tmuxmgr.HasSession(tmuxmgr.SessionName(inst.InstanceID))
-	d.mu.RLock()
-	_, connected := d.conns[inst.InstanceID]
-	d.mu.RUnlock()
+	d.runMu.Lock()
+	run, running := d.runs[inst.InstanceID]
+	d.runMu.Unlock()
+	cfg, _ := config.ReadAgentConfig(inst.RepoPath)
+
+	session := inst.SessionID
+	if session == "" {
+		session = "(none — next message starts fresh)"
+	} else if len(session) > 8 {
+		session = session[:8] + "…"
+	}
+	runLine := "no"
+	if running {
+		runLine = fmt.Sprintf("yes (started %s ago, msg_id=%d)", time.Since(run.started).Truncate(time.Second), run.msgID)
+	}
+	model := cfg.Model
+	if model == "" {
+		model = "(omp default)"
+	}
+	thinking := cfg.Thinking
+	if thinking == "" {
+		thinking = "(omp default)"
+	}
+
 	msg := fmt.Sprintf(
-		"instance: %s\nrepo: %s\npath: %s\nstate: %s\ntmux: %v\nchannel: %v\nfail_count: %d",
-		inst.InstanceID[:8], inst.RepoURL, inst.RepoPath, inst.State, alive, connected, inst.FailCount,
+		"instance: %s\nrepo: %s\npath: %s\nstate: %s\nsession: %s\nrun in flight: %s\nmodel: %s\nthinking: %s\nfail_count: %d",
+		inst.InstanceID[:8], inst.RepoURL, inst.RepoPath, inst.State, session, runLine, model, thinking, inst.FailCount,
 	)
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, msg)
 }
@@ -1090,7 +750,7 @@ func (d *Dispatcher) cmdForget(ctx context.Context, m *telegram.Message) {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	_ = tmuxmgr.KillSession(tmuxmgr.SessionName(inst.InstanceID))
+	_ = d.CancelRun(inst.InstanceID)
 	if err := d.store.Delete(inst.InstanceID); err != nil {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "forget failed: "+err.Error())
 		return
@@ -1104,19 +764,47 @@ func (d *Dispatcher) cmdWatch(ctx context.Context, m *telegram.Message) {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
 		return
 	}
-	out, err := tmuxmgr.CapturePane(tmuxmgr.SessionName(inst.InstanceID))
+	logPath, err := config.InstanceLogPath(inst.InstanceID)
 	if err != nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "capture failed: "+err.Error())
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "log path error: "+err.Error())
 		return
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		out = "(empty pane)"
+	data, err := tailFile(logPath, 200, 4000)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no log yet — send a message to spawn the agent first.")
+			return
+		}
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "read log failed: "+err.Error())
+		return
 	}
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, truncate(out, 4000))
+	out := strings.TrimSpace(data)
+	if out == "" {
+		out = "(empty log)"
+	}
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, out)
 }
 
-// routeToInstance forwards a non-command message to the bound instance's channel plugin.
+func (d *Dispatcher) cmdCancel(ctx context.Context, m *telegram.Message) {
+	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
+	if inst == nil {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
+		return
+	}
+	d.runMu.Lock()
+	_, running := d.runs[inst.InstanceID]
+	d.runMu.Unlock()
+	if !running {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no run in flight.")
+		return
+	}
+	_ = d.CancelRun(inst.InstanceID)
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Cancel requested.")
+}
+
+// routeToInstance is the hot path for ordinary (non-command) messages.
+// It looks up the bound instance, builds the prompt (text + voice
+// transcript + attachment notes), and queues or immediately spawns omp.
 func (d *Dispatcher) routeToInstance(ctx context.Context, m *telegram.Message, text string) {
 	inst, err := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
 	if err != nil {
@@ -1125,7 +813,6 @@ func (d *Dispatcher) routeToInstance(ctx context.Context, m *telegram.Message, t
 		return
 	}
 	if inst == nil {
-		// Not bound — silently ignore so the bot doesn't spam every chat it's in.
 		d.logger.Debug("route: no instance bound to topic — ignoring",
 			"chat", m.Chat.ID, "thread", m.MessageThreadID)
 		return
@@ -1143,54 +830,237 @@ func (d *Dispatcher) routeToInstance(ctx context.Context, m *telegram.Message, t
 			user = m.From.FirstName
 		}
 	}
-	frame := ws.Frame{
-		Type:      "message",
-		ChatID:    m.Chat.ID,
-		MessageID: m.MessageID,
-		ThreadID:  m.MessageThreadID,
-		User:      user,
-		Text:      text,
-		TS:        m.Date,
+
+	prompt := d.buildPrompt(ctx, m, text)
+	if prompt == "" {
+		d.logger.Info("route: empty prompt after attachments — skipping",
+			"instance", shortID(inst.InstanceID))
+		return
 	}
-	if m.Document != nil {
-		frame.AttachmentFileID = m.Document.FileID
-		frame.AttachmentName = m.Document.FileName
-	} else if len(m.Photo) > 0 {
-		ph := m.Photo[len(m.Photo)-1]
-		frame.AttachmentFileID = ph.FileID
-	} else if m.Voice != nil {
-		frame.AttachmentFileID = m.Voice.FileID
-		frame.AttachmentName = "voice.ogg"
-		if d.media.CanTranscribe() {
-			if transcript := d.transcribeAttachment(ctx, m.Voice.FileID); transcript != "" {
-				frame.Text = transcript
-			}
-		}
-	} else if m.Audio != nil {
-		frame.AttachmentFileID = m.Audio.FileID
-		frame.AttachmentName = m.Audio.FileName
-		if d.media.CanTranscribe() {
-			if transcript := d.transcribeAttachment(ctx, m.Audio.FileID); transcript != "" {
-				frame.Text = transcript
-			}
-		}
-	}
-	d.mu.RLock()
-	_, connected := d.conns[inst.InstanceID]
-	d.mu.RUnlock()
-	d.logger.Info("tg->claude forward",
+
+	d.logger.Info("tg->agent forward",
 		"instance", shortID(inst.InstanceID),
-		"chat", frame.ChatID, "thread", frame.ThreadID, "msg_id", frame.MessageID,
-		"from", user, "text_len", len(text), "text", preview(text),
-		"attach", frame.AttachmentFileID != "",
-		"channel_connected", connected,
+		"chat", m.Chat.ID, "thread", m.MessageThreadID, "msg_id", m.MessageID,
+		"from", user, "text_len", len(prompt), "text", preview(prompt),
 	)
-	d.sendTo(inst.InstanceID, frame)
+
+	d.enqueueOrRun(*inst, queuedPrompt{
+		chatID: m.Chat.ID,
+		thread: m.MessageThreadID,
+		msgID:  m.MessageID,
+		user:   user,
+		text:   prompt,
+	})
 }
 
-// handleEditedMessage forwards an edited Telegram message to the bound instance
-// so the user's corrections aren't silently lost.
-func (d *Dispatcher) handleEditedMessage(_ context.Context, m *telegram.Message) {
+// buildPrompt merges the user's text, any voice transcript, and any
+// attachment metadata into a single prompt string the agent receives.
+// Attachments are surfaced as a trailing "[attachment: <name> (<path>)]"
+// line so the agent can read them directly from disk via its tools.
+func (d *Dispatcher) buildPrompt(ctx context.Context, m *telegram.Message, text string) string {
+	var parts []string
+	if text != "" {
+		parts = append(parts, text)
+	}
+
+	switch {
+	case m.Voice != nil:
+		if d.media.CanTranscribe() {
+			if t := d.transcribeAttachment(ctx, m.Voice.FileID); t != "" {
+				parts = append(parts, t)
+			}
+		}
+	case m.Audio != nil:
+		if d.media.CanTranscribe() {
+			if t := d.transcribeAttachment(ctx, m.Audio.FileID); t != "" {
+				parts = append(parts, t)
+			}
+		}
+	case m.Document != nil:
+		if path, err := d.tg.DownloadFile(ctx, m.Document.FileID, d.opts.AttachDir); err == nil {
+			parts = append(parts, fmt.Sprintf("[attachment: %s (%s)]", m.Document.FileName, path))
+		}
+	case len(m.Photo) > 0:
+		ph := m.Photo[len(m.Photo)-1]
+		if path, err := d.tg.DownloadFile(ctx, ph.FileID, d.opts.AttachDir); err == nil {
+			parts = append(parts, fmt.Sprintf("[attachment: photo (%s)]", path))
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+// enqueueOrRun spawns the agent immediately if no run is in flight for
+// this instance, otherwise FIFO-queues the prompt. Holds runMu only long
+// enough to check or mutate the maps; driveAgentRun does its own locking
+// when it later finishes.
+func (d *Dispatcher) enqueueOrRun(inst storage.Instance, p queuedPrompt) {
+	d.runMu.Lock()
+	if _, busy := d.runs[inst.InstanceID]; busy {
+		d.pendingQueue[inst.InstanceID] = append(d.pendingQueue[inst.InstanceID], p)
+		d.runMu.Unlock()
+		// Acknowledge that the message is queued behind the active run.
+		go d.sendReaction(inst.ChatID, p.msgID, "👀")
+		return
+	}
+	runCtx, cancel := context.WithTimeout(context.Background(), d.opts.RunTimeout)
+	run := &agentRun{
+		instanceID: inst.InstanceID,
+		cancel:     cancel,
+		chatID:     p.chatID,
+		thread:     p.thread,
+		msgID:      p.msgID,
+		started:    time.Now(),
+	}
+	d.runs[inst.InstanceID] = run
+	d.runMu.Unlock()
+
+	go d.driveAgentRun(runCtx, inst, run, p)
+}
+
+// driveAgentRun is the per-message worker goroutine. It spawns omp, ranges
+// over the event stream, accumulates assistant text, captures the session
+// id, and (on completion) sends the final reply to Telegram. After the
+// channel closes it calls finishRun, which may immediately dispatch the
+// next queued prompt for this instance.
+func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, run *agentRun, p queuedPrompt) {
+	defer d.finishRun(inst.InstanceID)
+
+	agentCfg, _ := config.ReadAgentConfig(inst.RepoPath)
+	logPath, _ := config.InstanceLogPath(inst.InstanceID)
+
+	h, err := d.runner.Start(ctx, agent.RunOptions{
+		Cwd:       inst.RepoPath,
+		SessionID: inst.SessionID,
+		Model:     agentCfg.Model,
+		Thinking:  agentCfg.Thinking,
+		Prompt:    p.text,
+		LogPath:   logPath,
+		Binary:    d.opts.OMPBinary,
+	})
+	if err != nil {
+		d.logger.Error("agent.Start failed",
+			"instance", shortID(inst.InstanceID), "err", err)
+		d.sendText(ctx, p.chatID, p.thread, "agent spawn failed: "+err.Error())
+		return
+	}
+
+	d.runMu.Lock()
+	run.handle = h
+	d.runMu.Unlock()
+
+	var (
+		assistantBuf strings.Builder
+		sawFinal     bool
+		hadError     bool
+		errText      string
+	)
+
+	for ev := range h.Events() {
+		switch ev.Kind {
+		case agent.EvSessionID:
+			if inst.SessionID == "" && ev.SessionID != "" {
+				inst.SessionID = ev.SessionID
+				if err := d.store.Put(inst); err != nil {
+					d.logger.Warn("persist session id failed",
+						"instance", shortID(inst.InstanceID), "err", err)
+				} else {
+					d.logger.Info("captured session id",
+						"instance", shortID(inst.InstanceID),
+						"session", shortID(ev.SessionID))
+				}
+			}
+		case agent.EvAssistantDelta:
+			// Initial port collects deltas and sends once at the end.
+			// Streaming Telegram edits is a documented follow-up.
+			assistantBuf.WriteString(ev.Text)
+		case agent.EvAssistantFinal:
+			// Prefer the final text over the accumulated deltas — it is
+			// the canonical content omp wants us to surface.
+			assistantBuf.Reset()
+			assistantBuf.WriteString(ev.Text)
+			sawFinal = true
+		case agent.EvError:
+			hadError = true
+			errText = ev.Text
+			d.logger.Warn("agent error event",
+				"instance", shortID(inst.InstanceID), "text", ev.Text)
+		case agent.EvDone:
+			// noop — channel will close next.
+		}
+	}
+
+	reply := assistantBuf.String()
+	if hadError && reply == "" {
+		reply = "agent error: " + errText
+	} else if hadError {
+		reply = reply + "\n\n(agent reported: " + errText + ")"
+	}
+	if reply == "" {
+		if !sawFinal {
+			reply = "(agent produced no reply — see /watch for details)"
+		} else {
+			return
+		}
+	}
+
+	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i, chunk := range splitMessage(reply, 4000) {
+		replyTo := 0
+		if i == 0 {
+			replyTo = p.msgID
+		}
+		_, err := d.sendMessage(bgCtx, telegram.SendMessageParams{
+			ChatID:           p.chatID,
+			MessageThreadID:  p.thread,
+			Text:             chunk,
+			ReplyToMessageID: replyTo,
+		})
+		if err != nil {
+			d.logger.Warn("send reply chunk failed",
+				"instance", shortID(inst.InstanceID), "chunk", i, "err", err)
+		}
+	}
+}
+
+// finishRun removes the in-flight handle, then if more prompts are queued
+// for this instance, dispatches the next one immediately. Reloads the
+// Instance from bbolt so any SessionID written during the just-finished
+// run is visible.
+func (d *Dispatcher) finishRun(instanceID string) {
+	d.runMu.Lock()
+	if run, ok := d.runs[instanceID]; ok {
+		if run.cancel != nil {
+			run.cancel()
+		}
+	}
+	delete(d.runs, instanceID)
+	queue := d.pendingQueue[instanceID]
+	if len(queue) == 0 {
+		d.runMu.Unlock()
+		return
+	}
+	next := queue[0]
+	d.pendingQueue[instanceID] = queue[1:]
+	d.runMu.Unlock()
+
+	inst, err := d.store.Get(instanceID)
+	if err != nil || inst == nil {
+		d.logger.Warn("finishRun: instance vanished during queue drain",
+			"instance", shortID(instanceID), "err", err)
+		return
+	}
+	if inst.State != storage.StateRunning {
+		d.logger.Info("finishRun: instance stopped; dropping queued prompts",
+			"instance", shortID(instanceID), "queued", len(queue))
+		return
+	}
+	d.enqueueOrRun(*inst, next)
+}
+
+// handleEditedMessage forwards an edited Telegram message to the bound
+// instance so the user's corrections aren't silently lost.
+func (d *Dispatcher) handleEditedMessage(ctx context.Context, m *telegram.Message) {
 	if m.Chat.Type != "supergroup" || !m.Chat.IsForum {
 		return
 	}
@@ -1204,61 +1074,54 @@ func (d *Dispatcher) handleEditedMessage(_ context.Context, m *telegram.Message)
 	if !d.isUserAllowed(user) {
 		return
 	}
-	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
-	if inst == nil || inst.State != storage.StateRunning {
-		return
-	}
 	text := m.Text
 	if text == "" {
 		text = m.Caption
 	}
-	d.logger.Info("tg edited->claude",
-		"instance", shortID(inst.InstanceID), "msg_id", m.MessageID, "from", user,
-	)
-	frame := ws.Frame{
-		Type:      "message",
-		ChatID:    m.Chat.ID,
-		MessageID: m.MessageID,
-		ThreadID:  m.MessageThreadID,
-		User:      user,
-		Text:      fmt.Sprintf("(edited) %s", text),
-		TS:        m.Date,
+	if text == "" {
+		return
 	}
-	d.sendTo(inst.InstanceID, frame)
+	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
+	if inst == nil || inst.State != storage.StateRunning {
+		return
+	}
+	d.logger.Info("tg edited->agent",
+		"instance", shortID(inst.InstanceID), "msg_id", m.MessageID, "from", user)
+	d.enqueueOrRun(*inst, queuedPrompt{
+		chatID: m.Chat.ID,
+		thread: m.MessageThreadID,
+		msgID:  m.MessageID,
+		user:   user,
+		text:   fmt.Sprintf("(edited) %s", text),
+	})
+	_ = ctx
 }
 
-// sendFileSmartly picks the best Telegram send method based on file extension.
-func (d *Dispatcher) sendFileSmartly(ctx context.Context, chatID int64, threadID int, path, instanceID string) error {
-	ext := strings.ToLower(filepath.Ext(path))
-	var err error
-	switch ext {
-	case ".jpg", ".jpeg", ".png", ".gif", ".webp":
-		_, err = d.tg.SendPhoto(ctx, chatID, threadID, path, "")
-		if err == nil {
-			d.logger.Info("tg sendPhoto ok", "instance", shortID(instanceID), "path", path)
-		}
-	case ".ogg", ".oga", ".opus":
-		_, err = d.tg.SendVoice(ctx, chatID, threadID, path, "")
-		if err == nil {
-			d.logger.Info("tg sendVoice ok", "instance", shortID(instanceID), "path", path)
-		}
-	case ".mp3", ".m4a", ".wav", ".flac", ".aac":
-		_, err = d.tg.SendAudio(ctx, chatID, threadID, path, "")
-		if err == nil {
-			d.logger.Info("tg sendAudio ok", "instance", shortID(instanceID), "path", path)
-		}
-	default:
-		_, err = d.tg.SendDocument(ctx, chatID, threadID, path, "")
-		if err == nil {
-			d.logger.Info("tg sendDocument ok", "instance", shortID(instanceID), "path", path)
-		}
+// sendReaction is best-effort — failures get logged but never propagated.
+func (d *Dispatcher) sendReaction(chatID int64, msgID int, emoji string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.setReaction(ctx, chatID, msgID, emoji); err != nil {
+		d.logger.Debug("reaction failed", "chat", chatID, "msg_id", msgID, "err", err)
 	}
-	return err
+}
+
+// sendText is best-effort: failures get logged but never propagated. Used
+// for every dispatcher-to-Telegram interaction.
+func (d *Dispatcher) sendText(ctx context.Context, chatID int64, threadID int, text string) {
+	_, err := d.sendMessage(ctx, telegram.SendMessageParams{
+		ChatID:          chatID,
+		MessageThreadID: threadID,
+		Text:            text,
+	})
+	if err != nil {
+		d.logger.Warn("sendText failed", "err", err)
+	}
 }
 
 // transcribeAttachment downloads a Telegram file and runs Whisper on it.
-// Returns the transcript, or empty string on any failure (logged but not fatal).
-// Cleans up sidecar files (.txt, .vtt, .srt, .json) that whisper CLI may create.
+// Returns the transcript, or empty string on any failure (logged but not
+// fatal). Cleans up sidecar files the whisper CLI may create.
 func (d *Dispatcher) transcribeAttachment(ctx context.Context, fileID string) string {
 	path, err := d.tg.DownloadFile(ctx, fileID, d.opts.AttachDir)
 	if err != nil {
@@ -1270,7 +1133,6 @@ func (d *Dispatcher) transcribeAttachment(ctx context.Context, fileID string) st
 		d.logger.Warn("whisper: transcription failed", "path", path, "err", err)
 		return ""
 	}
-	// Whisper CLI writes sidecar files (e.g. file.txt alongside file.ogg). Clean them up.
 	base := strings.TrimSuffix(path, filepath.Ext(path))
 	for _, ext := range []string{".txt", ".vtt", ".srt", ".json", ".tsv"} {
 		sidecar := base + ext
@@ -1282,301 +1144,87 @@ func (d *Dispatcher) transcribeAttachment(ctx context.Context, fileID string) st
 	return transcript
 }
 
-// --- internals ---
-
-func (d *Dispatcher) launchTmux(inst storage.Instance) error {
-	return d.launchTmuxWithOpts(inst, true)
-}
-
-func (d *Dispatcher) launchTmuxFresh(inst storage.Instance) error {
-	return d.launchTmuxWithOpts(inst, false)
-}
-
-func (d *Dispatcher) launchTmuxWithOpts(inst storage.Instance, resume bool) error {
-	name := tmuxmgr.SessionName(inst.InstanceID)
-	if tmuxmgr.HasSession(name) {
-		d.logger.Info("launchTmux: session already exists", "instance", shortID(inst.InstanceID), "session", name)
-		return nil
-	}
-	cfgPath := filepath.Join(inst.RepoPath, ".trd", "config.json")
-	channelLog := filepath.Join(os.TempDir(), fmt.Sprintf("trd-channel-%s.log", shortID(inst.InstanceID)))
-	env := []string{
-		"TRD_CONFIG=" + cfgPath,
-		"TRD_INSTANCE_ID=" + inst.InstanceID,
-		"TRD_CHANNEL_LOG=" + channelLog,
-	}
-
-	claudeBin := firstNonEmpty(os.Getenv("TRD_CLAUDE_BIN"), "claude")
-	claudeArgs := os.Getenv("TRD_CLAUDE_ARGS")
-	if claudeArgs == "" {
-		claudeArgs = "--dangerously-skip-permissions --dangerously-load-development-channels server:trd-channel"
-		if d.opts.Debug {
-			claudeArgs = "--debug " + claudeArgs
-		}
-	}
-
-	// Use a fixed session ID derived from the instance ID so Claude always
-	// resumes the same conversation for a given instance. /reset starts fresh
-	// by omitting this flag.
-	if resume {
-		claudeArgs += " --session-id " + inst.InstanceID
-	}
-
-	cmd := fmt.Sprintf("%s %s", claudeBin, claudeArgs)
-	d.logger.Info("launchTmux",
-		"instance", shortID(inst.InstanceID), "session", name, "cwd", inst.RepoPath,
-	)
-	if err := tmuxmgr.NewSession(name, inst.RepoPath, cmd, env); err != nil {
-		return err
-	}
-
-	// Auto-confirm the dev-channels prompt by detecting it in the pane.
-	go d.autoConfirm(name, inst.InstanceID)
-	return nil
-}
-
-// autoConfirm polls the tmux pane looking for Claude Code's interactive
-// prompts (dev-channels warning, trust dialog) and sends Enter to dismiss.
-func (d *Dispatcher) autoConfirm(sessionName, instanceID string) {
-	const timeout = 30 * time.Second
-	const interval = 500 * time.Millisecond
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		time.Sleep(interval)
-		if !tmuxmgr.HasSession(sessionName) {
-			return
-		}
-		out, err := tmuxmgr.CapturePane(sessionName)
-		if err != nil {
-			continue
-		}
-		lower := strings.ToLower(strings.TrimSpace(out))
-		if lower == "" {
-			continue
-		}
-		// Detect any interactive confirmation prompt.
-		if strings.Contains(lower, "enter to confirm") ||
-			strings.Contains(lower, "local development") ||
-			strings.Contains(lower, "y/n") {
-			d.logger.Info("autoConfirm: detected prompt, sending Enter",
-				"instance", shortID(instanceID), "session", sessionName)
-			_ = tmuxmgr.SendKeys(sessionName, "Enter")
-			return
-		}
-	}
-	d.logger.Warn("autoConfirm: timed out without detecting prompt",
-		"instance", shortID(instanceID), "session", sessionName)
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-func (d *Dispatcher) resumeInstances() error {
+// findInstance resolves an instance by repo name or ID prefix. Same logic
+// as before; used by CancelRun.
+func (d *Dispatcher) findInstance(query string) (*storage.Instance, error) {
 	all, err := d.store.All()
 	if err != nil {
-		return err
+		return nil, err
+	}
+	var byName []storage.Instance
+	for _, inst := range all {
+		name := inst.RepoName
+		if name == "" {
+			name = storage.RepoNameFromURL(inst.RepoURL)
+		}
+		if strings.EqualFold(name, query) || strings.HasPrefix(strings.ToLower(name), strings.ToLower(query)) {
+			byName = append(byName, inst)
+		}
+	}
+	if len(byName) == 1 {
+		return &byName[0], nil
+	}
+	if len(byName) > 1 {
+		return nil, fmt.Errorf("%d instances match %q", len(byName), query)
 	}
 	for _, inst := range all {
-		if inst.State != storage.StateRunning {
-			continue
-		}
-		if tmuxmgr.HasSession(tmuxmgr.SessionName(inst.InstanceID)) {
-			continue
-		}
-		d.logger.Info("relaunching instance", "instance", inst.InstanceID)
-		if err := d.launchTmux(inst); err != nil {
-			d.logger.Warn("relaunch failed", "instance", inst.InstanceID, "err", err)
-			inst.State = storage.StateFailed
-			inst.FailCount++
-			_ = d.store.Put(inst)
+		if strings.HasPrefix(inst.InstanceID, query) {
+			return &inst, nil
 		}
 	}
-	return nil
+	return nil, fmt.Errorf("no instance matching %q", query)
 }
 
-func (d *Dispatcher) healthLoop(ctx context.Context) {
-	t := time.NewTicker(d.opts.HealthInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			d.checkHealth(ctx)
-		}
+// ompBinary resolves the omp executable per the precedence rule defined
+// in agent.Start (Options.OMPBinary > $TRD_OMP_BIN > "omp"). Centralised
+// here so cmdStart can fail fast with a clear error.
+func (d *Dispatcher) ompBinary() string {
+	if d.opts.OMPBinary != "" {
+		return d.opts.OMPBinary
 	}
+	return firstNonEmpty(os.Getenv("TRD_OMP_BIN"), "omp")
 }
 
-func (d *Dispatcher) sweepAttachments() {
-	maxAge := 7 * 24 * time.Hour
-	entries, err := os.ReadDir(d.opts.AttachDir)
-	if err != nil {
-		return
+// --- pure helpers ---
+
+// splitMessage breaks a long text into chunks of at most maxLen characters,
+// splitting at newline boundaries when possible. Identical to the
+// pre-port helper; carried over because Telegram's 4096 char limit is
+// independent of the agent backend.
+func splitMessage(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
 	}
-	cutoff := time.Now().Add(-maxAge)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	var chunks []string
+	for len(text) > 0 {
+		if len(text) <= maxLen {
+			chunks = append(chunks, text)
+			break
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
+		cut := maxLen
+		if idx := strings.LastIndex(text[:maxLen], "\n"); idx > maxLen/2 {
+			cut = idx + 1
 		}
-		if info.ModTime().Before(cutoff) {
-			path := filepath.Join(d.opts.AttachDir, e.Name())
-			if err := os.Remove(path); err == nil {
-				d.logger.Info("swept old attachment", "path", path, "age_days", int(time.Since(info.ModTime()).Hours()/24))
-			}
-		}
+		chunks = append(chunks, text[:cut])
+		text = text[cut:]
 	}
+	return chunks
 }
-
-func (d *Dispatcher) checkHealth(ctx context.Context) {
-	d.sweepAttachments()
-	all, err := d.store.All()
-	if err != nil {
-		return
-	}
-	for _, inst := range all {
-		if inst.State != storage.StateRunning {
-			continue
-		}
-		name := tmuxmgr.SessionName(inst.InstanceID)
-		if !tmuxmgr.HasSession(name) {
-			// Session dead — restart it.
-			d.logger.Warn("session dead, restarting", "instance", inst.InstanceID, "fails", inst.FailCount)
-			if inst.FailCount >= 3 {
-				inst.State = storage.StateFailed
-				_ = d.store.Put(inst)
-				d.sendText(ctx, inst.ChatID, inst.TopicID,
-					"Instance failed to start after 3 attempts. Use /restart to retry.")
-				continue
-			}
-			if err := d.launchTmux(inst); err != nil {
-				inst.FailCount++
-				_ = d.store.Put(inst)
-				d.logger.Warn("restart failed", "err", err)
-				continue
-			}
-			inst.FailCount = 0
-			_ = d.store.Put(inst)
-			continue
-		}
-		// Session alive — check for rate-limit or stuck state.
-		d.checkRateLimit(ctx, inst, name)
-	}
-}
-
-// checkRateLimit inspects a running tmux pane for Claude's rate-limit prompt
-// and auto-dismisses it. Notifies the topic once when rate-limited and again
-// when recovered.
-func (d *Dispatcher) checkRateLimit(ctx context.Context, inst storage.Instance, sessionName string) {
-	out, err := tmuxmgr.CapturePane(sessionName)
-	if err != nil {
-		return
-	}
-	pane := strings.TrimSpace(out)
-	if pane == "" {
-		return
-	}
-
-	d.rateLimitedMu.Lock()
-	wasLimited := d.rateLimited[inst.InstanceID]
-	d.rateLimitedMu.Unlock()
-
-	isLimited := strings.Contains(pane, "rate-limit-options") ||
-		strings.Contains(pane, "hit your limit") ||
-		strings.Contains(pane, "You've hit your limit")
-
-	if isLimited {
-		// Auto-dismiss the rate-limit menu by pressing Enter.
-		d.logger.Info("rate-limit detected, auto-dismissing",
-			"instance", shortID(inst.InstanceID))
-		_ = tmuxmgr.SendKeys(sessionName, "Enter")
-
-		if !wasLimited {
-			d.rateLimitedMu.Lock()
-			d.rateLimited[inst.InstanceID] = true
-			d.rateLimitedMu.Unlock()
-
-			// Extract reset time if visible.
-			resetInfo := ""
-			for _, line := range strings.Split(pane, "\n") {
-				if strings.Contains(line, "resets") {
-					resetInfo = " (" + strings.TrimSpace(line) + ")"
-					break
-				}
-			}
-			d.sendText(ctx, inst.ChatID, inst.TopicID,
-				"⏳ Claude hit a rate limit"+resetInfo+". Auto-waiting for it to reset — no action needed.")
-		}
-		return
-	}
-
-	// Check if we're in "waiting for limit" state.
-	isWaiting := strings.Contains(pane, "Waiting for") && strings.Contains(pane, "limit")
-	if isWaiting {
-		if !wasLimited {
-			d.rateLimitedMu.Lock()
-			d.rateLimited[inst.InstanceID] = true
-			d.rateLimitedMu.Unlock()
-		}
-		return
-	}
-
-	// If previously rate-limited but pane looks normal now → recovered.
-	if wasLimited {
-		d.rateLimitedMu.Lock()
-		d.rateLimited[inst.InstanceID] = false
-		d.rateLimitedMu.Unlock()
-		d.logger.Info("rate-limit recovered", "instance", shortID(inst.InstanceID))
-		d.sendText(ctx, inst.ChatID, inst.TopicID,
-			"✅ Rate limit cleared — Claude is back.")
-	}
-}
-
-func (d *Dispatcher) sendText(ctx context.Context, chatID int64, threadID int, text string) {
-	_, err := d.tg.SendMessage(ctx, telegram.SendMessageParams{
-		ChatID:          chatID,
-		MessageThreadID: threadID,
-		Text:            text,
-	})
-	if err != nil {
-		d.logger.Warn("sendText failed", "err", err)
-	}
-}
-
-// Logs returns the captured tmux pane content for the topic's instance.
-func (d *Dispatcher) Logs(chatID int64, threadID int) (string, error) {
-	inst, _ := d.store.ByTopic(chatID, threadID)
-	if inst == nil {
-		return "", errors.New("no instance for topic")
-	}
-	return tmuxmgr.CapturePane(tmuxmgr.SessionName(inst.InstanceID))
-}
-
-// --- helpers ---
 
 // normalizeRepoURL accepts three URL formats and converts to SSH:
-//   git@host:org/repo.git   → pass through
-//   https://host/org/repo   → git@host:org/repo.git
-//   host/org/repo           → git@host:org/repo.git
-// Rejects flag-like input (starts with -) and URLs that don't look like a valid repo path.
+//
+//	git@host:org/repo.git   → pass through
+//	https://host/org/repo   → git@host:org/repo.git
+//	host/org/repo           → git@host:org/repo.git
+//
+// Rejects flag-like input (starts with -) and URLs that don't look like
+// a valid repo path.
 func normalizeRepoURL(raw string) (string, error) {
 	if strings.HasPrefix(raw, "-") {
 		return "", fmt.Errorf("URL must not start with a dash")
 	}
 
-	// SSH format: git@host:path
 	if strings.HasPrefix(raw, "git@") {
-		// Minimal validation: must have a colon and path after it.
 		if !strings.Contains(raw[4:], ":") {
 			return "", fmt.Errorf("SSH URL missing colon: %q", raw)
 		}
@@ -1586,7 +1234,6 @@ func normalizeRepoURL(raw string) (string, error) {
 		return raw, nil
 	}
 
-	// Strip scheme if present.
 	u := raw
 	if after, ok := strings.CutPrefix(u, "https://"); ok {
 		u = after
@@ -1594,8 +1241,6 @@ func normalizeRepoURL(raw string) (string, error) {
 		u = after
 	}
 
-	// Now we expect: host/org/repo or host/org/repo.git
-	// Must have at least host/org/repo (2 slashes worth of path).
 	parts := strings.SplitN(u, "/", 3)
 	if len(parts) < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return "", fmt.Errorf("expected format: host/org/repo, got %q", raw)
@@ -1607,12 +1252,13 @@ func normalizeRepoURL(raw string) (string, error) {
 	return fmt.Sprintf("git@%s:%s.git", host, path), nil
 }
 
-func randomHex(n int) (string, error) {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
 	}
-	return hex.EncodeToString(buf), nil
+	return ""
 }
 
 func truncate(s string, n int) string {
@@ -1622,7 +1268,8 @@ func truncate(s string, n int) string {
 	return s[:n] + "…(truncated)"
 }
 
-// shortID returns the first 8 chars of an instance ID for compact log output.
+// shortID returns the first 8 chars of an instance id for compact log
+// output. Identifiers shorter than that are returned unchanged.
 func shortID(id string) string {
 	if len(id) <= 8 {
 		return id
@@ -1630,10 +1277,10 @@ func shortID(id string) string {
 	return id[:8]
 }
 
-// preview returns a single-line, length-capped sample of s suitable for logs.
+// preview returns a single-line, length-capped sample of s suitable for
+// logs. Collapses newlines so structured log records stay on one line.
 func preview(s string) string {
 	const max = 200
-	// Collapse newlines so log records stay on one line.
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	s = strings.ReplaceAll(s, "\r", "")
 	if len(s) > max {
@@ -1642,50 +1289,37 @@ func preview(s string) string {
 	return s
 }
 
-// writeMCPConfig merges a trd-channel entry into the repo's .mcp.json so Claude
-// finds the channel plugin. If the repo already has an .mcp.json, we preserve
-// existing servers and only add/overwrite the "trd-channel" key.
-//
-// Resolution order for the channel command:
-//  1. $TRD_CHANNEL_ENTRY set → `bun run <path>` (dev install)
-//  2. default               → `trd-channel` (npm bin on PATH)
-func writeMCPConfig(repoPath string) error {
-	mcpPath := filepath.Join(repoPath, ".mcp.json")
-
-	entry := os.Getenv("TRD_CHANNEL_ENTRY")
-	var command string
-	var args []string
-	if entry != "" {
-		command = "bun"
-		args = []string{"run", entry}
-	} else {
-		command = "trd-channel"
-		args = []string{}
+// looksLikeModelName allows free-form names that contain a letter so
+// fuzzy-match aliases like "anthropic/claude-opus-4-7" still work without
+// hard-coding every provider/model.
+func looksLikeModelName(s string) bool {
+	if s == "" {
+		return false
 	}
-
-	type serverDef struct {
-		Command string   `json:"command"`
-		Args    []string `json:"args"`
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
 	}
-	type mcpFile struct {
-		MCPServers map[string]json.RawMessage `json:"mcpServers"`
-	}
+	return false
+}
 
-	var existing mcpFile
-	if data, err := os.ReadFile(mcpPath); err == nil {
-		_ = json.Unmarshal(data, &existing)
-	}
-	if existing.MCPServers == nil {
-		existing.MCPServers = make(map[string]json.RawMessage)
-	}
-
-	trdEntry, _ := json.Marshal(serverDef{Command: command, Args: args})
-	existing.MCPServers["trd-channel"] = trdEntry
-
-	out, err := json.MarshalIndent(existing, "", "  ")
+// tailFile returns the last maxLines lines of path, capped at maxBytes
+// bytes. Reads the whole file (these logs are bounded by run frequency,
+// not size, and run.LogPath rotates on per-instance deletion). Returns
+// os.ErrNotExist when the path is absent.
+func tailFile(path string, maxLines, maxBytes int) (string, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return "", err
 	}
-	out = append(out, '\n')
-	return os.WriteFile(mcpPath, out, 0o644)
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	out := strings.Join(lines, "\n")
+	if len(out) > maxBytes {
+		out = out[len(out)-maxBytes:]
+	}
+	return out, nil
 }

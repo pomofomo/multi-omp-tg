@@ -1,4 +1,11 @@
-# Porting TRD to OMP Harness
+# Porting TRD to OMP Harness (HISTORICAL)
+
+> **Status: superseded.** This is the first port analysis, written when the
+> plan was to swap Claude for OMP while keeping the persistent-agent +
+> WebSocket + tmux architecture intact. The final port (`porting/PLAN.md`
+> and `porting/REWRITE.md`) replaces that architecture with one-shot
+> `omp -p` subprocesses. Kept for reference only.
+
 
 This document identifies every Claude Code-specific coupling in the TRD codebase and describes what a port to the OMP harness would need to replace.
 

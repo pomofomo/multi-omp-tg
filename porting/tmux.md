@@ -1,4 +1,12 @@
-# tmux → headless migration analysis
+# tmux → headless migration analysis (HISTORICAL)
+
+> **Status: superseded.** This file enumerated tmux call sites and
+> proposed migrating to an `agentmgr` package that still managed a
+> persistent agent process per instance. The final port skips that
+> intermediate step entirely: every Telegram message spawns a one-shot
+> `omp -p` subprocess, and `internal/tmuxmgr` is deleted. Kept for
+> reference only.
+
 
 Every tmux call in TRD, what it provides, and whether `omp -p` subprocess management can replace it.
 

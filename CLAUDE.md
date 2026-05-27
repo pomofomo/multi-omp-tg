@@ -1,10 +1,12 @@
 # CLAUDE.md
 
-Key context for Claude Code when editing this repo. For full details see [ARCHITECTURE.md](./ARCHITECTURE.md) and [DEV.md](./DEV.md).
+Key context for an agent editing this repo. For full details see [ARCHITECTURE.md](./ARCHITECTURE.md) and [DEV.md](./DEV.md).
 
 ## What this is
 
-`trd` (Telegram Repo Dispatcher) routes between a Telegram supergroup and multiple Claude Code instances. Each forum topic = one repo. `/start <git-url>` clones it, spawns `claude` in tmux, and bridges messages both ways.
+`trd` (Telegram Repo Dispatcher) routes between a Telegram supergroup and multiple [omp](https://github.com/oh-my-pi/oh-my-pi) coding agent instances. Each forum topic is bound to one cloned repo. `/start <git-url>` clones; every subsequent user message spawns `omp -p --resume <session-id>` in that repo and forwards the reply.
+
+**There is no persistent agent.** No tmux per instance, no WebSocket bridge, no MCP channel plugin. Conversation continuity lives in omp's own session storage (`~/.omp/agent/sessions/`); the dispatcher just remembers the session id per instance in bbolt.
 
 ## Build / test / run
 
@@ -13,65 +15,59 @@ make build              # CGO_ENABLED=1 go build → bin/trd
 make install            # build + copy to ~/.local/bin/trd
 make test               # go test ./...
 make lint               # go vet ./...
-make restart            # rebuild + restart dispatcher in tmux
+make restart            # rebuild + restart dispatcher in operator tmux
 make install-models     # download whisper + TTS models (~230MB)
-```
-
-Channel plugin:
-```bash
-cd channel && bun install
-bunx tsc --noEmit       # typecheck
 ```
 
 ## Key files
 
 | File | Role |
 |------|------|
-| `cmd/trd/main.go` | CLI entry, subcommand dispatch, settings persistence |
-| `internal/dispatcher/dispatcher.go` | **The hub** — Telegram poll, WS server, tmux manager, health loop, rate-limit watchdog, command handlers |
+| `cmd/trd/main.go` | CLI entry, subcommand dispatch, persisted settings |
+| `internal/dispatcher/dispatcher.go` | **The hub** — Telegram poll, command handlers, per-instance FIFO run queue |
+| `internal/agent/agent.go` | Wraps `omp -p --mode json`, parses NDJSON, exposes classified events |
+| `internal/api/api.go` | HTTP control plane for the CLI — `/api/instances`, `/api/allowed/*`, `/api/instances/{id}/cancel`, `/healthz` |
 | `internal/media/media.go` | Whisper STT + VITS TTS via sherpa-onnx (CGo), OpenAI API fallback |
 | `internal/audio/audio.go` | OGG/Opus decode/encode (replaces ffmpeg) |
-| `internal/storage/storage.go` | bbolt: instances, topic/secret indexes, allowlist, settings |
-| `internal/ws/ws.go` | WebSocket server, Frame protocol, HTTP API endpoints |
+| `internal/storage/storage.go` | bbolt: instances (with `SessionID`), allowlist, settings |
+| `internal/config/config.go` | Path helpers (`~/.trd/...`) + per-repo `<repo>/.trd/agent.json` (model/thinking) |
 | `internal/telegram/telegram.go` | Minimal hand-rolled Telegram Bot API client |
-| `internal/tmuxmgr/tmuxmgr.go` | tmux session lifecycle |
-| `channel/index.ts` | MCP channel plugin — WS bridge + behavioral instructions |
 
 ## Package dependency graph
 
 ```
-cmd/trd → dispatcher → storage, telegram, tmuxmgr, ws, config, media
+cmd/trd → dispatcher → storage, telegram, config, media, agent, api
                        media → audio
 ```
 
-No cycles. Leaf packages (`config`, `storage`, `audio`, `telegram`, `tmuxmgr`) have no internal deps.
+No cycles. Leaf packages (`config`, `storage`, `audio`, `telegram`, `agent`, `api`) have no inter-internal deps beyond the standard library.
 
 ## Dispatcher command handlers
 
-Telegram: `cmdStart`, `cmdStop`, `cmdRestart`, `cmdReset`, `cmdStatus`, `cmdWatch`, `cmdDebug`, `cmdForget`. Non-commands → `routeToInstance`.
+Telegram: `/start`, `/stop`, `/restart`, `/reset`, `/status`, `/watch`, `/cancel`, `/model`, `/effort`, `/debug`, `/forget`, `/help`. Non-commands → `routeToInstance` → `enqueueOrRun` → `driveAgentRun`.
 
-## WS frame types
+## Agent event types
 
-Server→plugin: `message`, `download_result`, `tts_result`. Plugin→server: `hello`, `reply`, `react`, `edit`, `download`, `tts`.
+`internal/agent` emits `Event{Kind: …}` over a channel:
+
+- `EvSessionID` — first line of every run; persists to `Instance.SessionID`.
+- `EvAssistantDelta` — streaming text chunk (collected, not yet streamed to Telegram).
+- `EvAssistantFinal` — finalized assistant message; canonical reply content.
+- `EvError` — API errors (overloaded, rate limit) and parse failures.
+- `EvDone` — terminal event; channel closes immediately after.
+
+See `porting/PLAN.md` Appendix A for the source NDJSON shapes.
 
 ## Storage buckets
 
-`instances`, `by_topic`, `by_secret`, `allowed_users`, `settings`. Use the Store methods — don't access buckets directly.
-
-## Restart workflow
-
-```bash
-make restart    # rebuilds binary, Ctrl+C dispatcher, starts again
-```
-
-Claude instances keep running. Channel plugins reconnect automatically (exponential backoff). `resumeInstances` relaunches dead tmux sessions on dispatcher start. `/restart` resumes conversation via `--continue`. `/reset` starts fresh.
+`instances`, `by_topic`, `by_secret` (kept for backward-compat with old rows; `Secret` is unused after the headless port), `allowed_users`, `settings`. Always use Store methods — never read buckets directly.
 
 ## Conventions
 
-- **Dispatcher does all Telegram API calls.** Channel plugin is a stateless WS↔MCP bridge.
-- **Channel plugin stays thin.** Add logic to the Go dispatcher, route via new frame types.
-- **tmux session names:** `trd-<instance-id>` — `tmuxmgr.SessionName` is the source of truth.
-- **Secrets:** `.trd/config.json` mode 0600, WS on `127.0.0.1` only.
+- **One run per instance at a time.** A second message while a run is in flight queues FIFO until the first finishes; the queued message gets a 👀 reaction.
+- **omp is spawned per message.** Don't reintroduce a persistent agent without RFC.
+- **Session id is captured from the first NDJSON line.** Pass it as `--resume` on subsequent runs in that instance.
+- **`<repo>/.trd/agent.json`** is the source of truth for per-instance model/thinking overrides.
 - **`.trd/` is auto-gitignored** in cloned repos.
 - **CGo required** for sherpa-onnx (whisper + TTS) and libopus (audio codec).
 - **Env vars are persisted** to bbolt settings bucket on first start. Future restarts read from DB.
@@ -81,7 +77,11 @@ Claude instances keep running. Channel plugins reconnect automatically (exponent
 | Source | Location |
 |--------|----------|
 | Dispatcher | `tmux attach -t trd` or `~/.trd/trd.log` |
-| Channel plugin | `/tmp/trd-channel.log` |
-| Claude Code | `~/.claude/debug/<session-id>.txt` |
+| Per-instance agent stderr | `~/.trd/logs/<instance-id>.log` |
+| omp session JSONL | `~/.omp/agent/sessions/<cwd-mangled>/<timestamp>_<session-id>.jsonl` |
 
 Toggle verbose: `/debug` in Telegram or `trd start --debug`.
+
+## Tests
+
+The agent package re-invokes the test binary itself as a fake `omp` (via `TRD_AGENT_TEST_FAKE_OMP_MODE`); see `internal/agent/agent_test.go`. The dispatcher's routing tests use the `runner` test seam (no real omp, no real Telegram) — see `internal/dispatcher/routing_test.go`.

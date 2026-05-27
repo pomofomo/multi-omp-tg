@@ -10,7 +10,7 @@ make install            # build + copy to ~/.local/bin/trd
 make test               # go test ./...
 make lint               # go vet ./...
 make install-models     # download whisper + TTS models (~230MB)
-make restart            # rebuild + restart dispatcher in tmux
+make restart            # rebuild + restart dispatcher in operator tmux
 make start              # start dispatcher (reads saved config from DB)
 ```
 
@@ -20,15 +20,15 @@ First-time setup:
 make setup TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 ```
 
-This builds, installs channel plugin deps, starts the dispatcher in a tmux session named `trd`, and saves config to the database.
+This builds, installs the binary, starts the dispatcher in an operator tmux session named `trd`, and saves the token to bbolt. The operator tmux exists only so the dispatcher process survives an SSH disconnect — agents are not spawned in tmux, they are one-shot `omp -p` subprocesses.
 
 ### Build dependencies
 
 | Package | Why | Install |
 |---------|-----|---------|
 | Go 1.22+ | compiles the dispatcher | [go.dev/dl](https://go.dev/dl) |
-| `libopus-dev` | Opus codec for voice (CGo) | `apt install libopus-dev libopusfile-dev` |
-| `bun` | runs the channel plugin | `curl -fsSL https://bun.sh/install \| bash` |
+| `libopus-dev` + `libopusfile-dev` | Opus codec for voice (CGo) | `apt install libopus-dev libopusfile-dev` |
+| `omp` | the headless coding agent | `npm install -g @oh-my-pi/pi-coding-agent` |
 
 CGo is required (`CGO_ENABLED=1`) because of sherpa-onnx (whisper + TTS) and libopus.
 
@@ -37,25 +37,24 @@ CGo is required (`CGO_ENABLED=1`) because of sherpa-onnx (whisper + TTS) and lib
 ```
 cmd/trd/main.go                  CLI entry point, subcommand dispatch
 internal/
-  dispatcher/dispatcher.go       The hub — Telegram poll, WS, tmux, health loop
-  ws/ws.go                       WebSocket server + Frame protocol
+  dispatcher/dispatcher.go       The hub — Telegram poll, command handlers, per-instance FIFO run queue
+  agent/agent.go                 omp -p wrapper: NDJSON parser, classified events, cancellation
+  api/api.go                     HTTP control plane for the CLI
   storage/storage.go             bbolt wrapper (instances, allowlist, settings)
   media/media.go                 Whisper STT + VITS TTS (sherpa-onnx embedded)
   audio/audio.go                 OGG/Opus decode/encode (replaces ffmpeg)
   telegram/telegram.go           Minimal Telegram Bot API client
-  tmuxmgr/tmuxmgr.go            tmux session management
-  config/                        Paths, repo config, gitignore
-channel/index.ts                 MCP channel plugin (Bun/TypeScript)
+  config/                        Paths, per-repo agent.json, gitignore
 ```
 
 ### Package dependency graph
 
 ```
-cmd/trd → dispatcher → storage, telegram, tmuxmgr, ws, config, media
+cmd/trd → dispatcher → storage, telegram, config, media, agent, api
                        media → audio
 ```
 
-Leaf packages (`config`, `storage`, `audio`, `telegram`, `tmuxmgr`) have no internal deps. Don't introduce cycles.
+No cycles. Don't introduce them. Leaf packages (`config`, `storage`, `audio`, `telegram`, `agent`, `api`) have no inter-internal deps.
 
 ## Contributing
 
@@ -65,34 +64,37 @@ Leaf packages (`config`, `storage`, `audio`, `telegram`, `tmuxmgr`) have no inte
 
 ### Self-development workflow
 
-TRD can manage its own repo. After the initial setup:
+TRD can manage its own repo:
 
 1. Create a topic in your Telegram group.
-2. Send `/start git@github.com:you/multi-claude-tg.git`.
-3. Run `make self-modify NAME=multi-claude-tg` to point the channel plugin at the instance's checkout.
-4. Now edits to `channel/index.ts` in the instance take effect on restart.
+2. Send `/start git@github.com:you/multi-omp-tg.git` to clone your fork.
+3. Talk to the agent in that topic. It edits your fork directly (the repo is cloned to `~/.trd/repos/<instance-id>`).
+4. When ready, push and `make restart` to rebuild the dispatcher with your changes.
 
-For Go changes, tell Claude to run `make restart` — it rebuilds the binary and restarts the dispatcher. Channel plugins reconnect automatically.
+There is no longer a "self-modify" target — the channel plugin is gone, so no live indirection is needed.
 
 ## Conventions
 
-- **Telegram client** is a hand-rolled `net/http` wrapper — keep it minimal (only methods TRD actually calls).
-- **Channel plugin stays thin** (~470 lines). Business logic goes in the Go dispatcher; route via a new WS frame type.
-- **tmux session names** are `trd-<instance-id>`. `tmuxmgr.SessionName` is the single source of truth.
-- **Secrets** in `.trd/config.json` at mode 0600. Dispatcher WS on `127.0.0.1` only.
+- **Telegram client** is a hand-rolled `net/http` wrapper. Keep it minimal — only methods TRD actually calls.
+- **One run per instance at a time.** Concurrent messages queue FIFO. Don't reintroduce a persistent agent without an RFC.
+- **omp wire format** is documented in `porting/PLAN.md` Appendix A. Any new event types go through `agent.classify`.
+- **`<repo>/.trd/agent.json`** is the source of truth for per-instance model/thinking overrides.
 - **`.trd/` is auto-gitignored** in cloned repos. Don't remove.
+- **Env vars are persisted** to bbolt settings bucket on first start. See `persistedEnvKeys` in `cmd/trd/main.go`.
 
 ## Adding a new Telegram command
 
 1. Add the case in `handleMessage`'s switch block in `dispatcher.go`.
 2. Write the `cmd<Name>` handler method.
-3. Update the README Telegram commands table.
+3. Add the command to `SetMyCommands` in `pollLoop` for Telegram autocomplete.
+4. Update the README Telegram commands table and the `/help` text in `cmdHelp`.
 
-## Adding a new WS frame type
+## Adding a new agent event type
 
-1. Add the field(s) to `ws.Frame` if needed.
-2. Handle the new `frame.Type` case in `dispatcher.OnOutbound`.
-3. Add the corresponding tool in `channel/index.ts` (ListToolsRequestSchema + CallToolRequestSchema handlers).
+1. Add the `Ev*` constant in `internal/agent/agent.go`.
+2. Map the source NDJSON shape in `agent.classify`.
+3. Handle the event in `dispatcher.driveAgentRun`'s switch block.
+4. Add a unit test in `agent_test.go` (the test binary doubles as a fake omp via `TRD_AGENT_TEST_FAKE_OMP_MODE`).
 
 ## Debugging
 
@@ -106,58 +108,54 @@ tail -f ~/.trd/trd.log          # from another terminal
 trd start --debug               # verbose mode (or TRD_DEBUG=1)
 ```
 
-Toggle debug at runtime: send `/debug` in any Telegram topic. New/restarted Claude instances will include/omit `--debug` accordingly.
+Toggle debug at runtime: send `/debug` in any Telegram topic.
 
-### 2. Channel plugin logs
-
-```bash
-tail -f /tmp/trd-channel.log
-```
-
-Override path with `TRD_CHANNEL_LOG` env var. Shows: WS connect/disconnect, frame send/recv, MCP notification delivery, tool calls.
-
-### 3. Claude Code debug logs
+### 2. Per-instance agent stderr
 
 ```bash
-ls -lt ~/.claude/debug/                    # most recent session first
-tail -100 ~/.claude/debug/<session-id>.txt
+trd watch <instance-name>       # via the CLI
+# or
+tail -f ~/.trd/logs/<instance-id>.log
 ```
 
-MCP protocol from Claude's side — useful when the plugin connects but messages aren't getting through.
+`/watch` in a Telegram topic also tails this file.
+
+### 3. omp session JSONL
+
+```bash
+ls -lt ~/.omp/agent/sessions/    # most recently used cwd-mangled dirs first
+```
+
+Each session file is the full conversation. `omp -p --resume <id>` replays it.
 
 ### Quick debug checklist
 
 | Symptom | Check |
 |---------|-------|
-| Message not arriving | `trd.log`: look for "tg recv" → "tg->claude forward" → "frame queued". If "no live channel", plugin isn't connected. |
-| Plugin not connecting | `/tmp/trd-channel.log`: look for "ws connect" / "ws error". Verify `.trd/config.json` port + secret. |
-| Claude not responding | `/watch` in the topic. Check for rate-limit prompts (watchdog auto-dismisses). |
-| TTS/Whisper broken | `trd.log`: search for "whisper:" or "tts" entries. Verify models in `~/.trd/models/`. |
-| Rate-limited | Watchdog auto-dismisses and notifies topic. Check `trd.log` for "rate-limit detected". |
+| Message not arriving | `trd.log`: look for "tg recv" → "tg->agent forward". |
+| Agent spawn failing | `trd.log`: "agent.Start failed". Verify `omp` is on `$PATH` or set `TRD_OMP_BIN`. |
+| No reply | `trd watch <name>`: check omp stderr for crashes / API errors. |
+| Session not resuming | `/reset` to clear the session id; next message starts fresh. omp can't resume a `.tmp` session file (left behind by a killed run). |
+| TTS/Whisper broken | `trd.log`: search for "whisper:" entries. Verify models in `~/.trd/models/`. |
 
 ## Environment variables
 
 | Variable | Purpose | Persisted |
 |----------|---------|-----------|
 | `TELEGRAM_BOT_TOKEN` | Bot authentication | Yes |
-| `TRD_PORT` | Dispatcher HTTP/WS port (default 7777) | No |
-| `TRD_CHANNEL_ENTRY` | Path to channel plugin source | Yes |
+| `TRD_PORT` | Dispatcher HTTP API port (default 7777) | No |
+| `TRD_OMP_BIN` | omp binary path (default `omp` on PATH) | Yes |
 | `TRD_WHISPER_MODEL_DIR` | Whisper model directory | Yes |
 | `TRD_TTS_MODEL_DIR` | TTS model directory | Yes |
 | `TRD_OPENAI_API_KEY` | OpenAI API fallback for STT/TTS | Yes |
 | `TRD_ALLOWED_USERNAMES` | Comma-separated allowlist | Yes |
 | `TRD_DEBUG` | Set to "1" for debug mode | No |
-| `TRD_HEALTH_INTERVAL_SEC` | Health loop interval (default 30) | No |
-| `TRD_CLAUDE_BIN` | Claude binary name (default "claude") | No |
-| `TRD_CLAUDE_ARGS` | Override Claude arguments entirely | No |
-| `TRD_CLAUDE_CONFIRM_KEYS` | Keys to send for dev-channels prompt (default "Enter") | No |
 
 "Persisted" means saved to bbolt on first start and restored on future starts when the env var isn't set.
 
 ## Security model
 
 - **Authorization:** Supergroup membership = authorized. User allowlist (`trd allow/deny`) adds fine-grained control.
-- **Secrets:** Per-instance 256-bit secret in `.trd/config.json` (mode 0600). Unknown secrets rejected.
-- **Networking:** Dispatcher on `127.0.0.1` only. No external exposure.
+- **Networking:** Dispatcher HTTP API on `127.0.0.1` only. No external exposure.
 - **Private repos:** SSH agent / `~/.ssh/` config.
-- **`.mcp.json`** is mode 0644 — it's just a pointer to the channel plugin, not a secret.
+- **Agent capabilities:** `omp` runs with whatever filesystem/network permissions the dispatcher itself has. Run the dispatcher under a dedicated user if you're worried.

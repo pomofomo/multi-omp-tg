@@ -4,25 +4,19 @@ The technologies and libraries used in TRD, explained so you can reuse the same 
 
 ## Language: Go 1.23
 
-Go for the main binary. Chosen for single-binary distribution, fast startup, low memory, and excellent concurrency primitives. CGo is required for the audio/ML libraries.
+Go for the only binary. Chosen for single-binary distribution, fast startup, low memory, and excellent concurrency primitives. CGo is required for the audio/ML libraries.
 
 ```bash
 go.dev/dl   # install
 ```
 
-## Language: TypeScript (Bun)
-
-The MCP channel plugin is ~470 lines of TypeScript, run with Bun. Bun is used instead of Node because it's faster to start and has native TypeScript support without a compile step.
-
-```bash
-curl -fsSL https://bun.sh/install | bash
-```
+There is no TypeScript code in the project after the headless-omp port — the old MCP channel plugin is gone.
 
 ## Database: bbolt
 
 [go.etcd.io/bbolt](https://pkg.go.dev/go.etcd.io/bbolt) — embedded key-value store. Pure Go, single-file database (`~/.trd/state.db`), transactional, zero external dependencies.
 
-Used for: instance state, topic/secret indexes, user allowlist, persistent settings.
+Used for: instance state (incl. captured omp session id), user allowlist, persistent settings.
 
 **Why bbolt:** No server to run, survives crashes (ACID), tiny footprint, perfect for single-process apps. The etcd project's fork of BoltDB.
 
@@ -36,34 +30,32 @@ db.Update(func(tx *bolt.Tx) error {
 })
 ```
 
-## WebSocket: coder/websocket
-
-[github.com/coder/websocket](https://pkg.go.dev/github.com/coder/websocket) (formerly nhooyr/websocket) — modern, context-aware WebSocket library. No CGo.
-
-Used for: real-time communication between the dispatcher and channel plugins.
-
-**Why this over gorilla/websocket:** Smaller API surface, context cancellation built in, actively maintained by Coder.
-
-```go
-import "github.com/coder/websocket"
-
-conn, _ := websocket.Accept(w, r, nil)
-conn.Write(ctx, websocket.MessageText, data)
-```
-
 ## HTTP router: net/http stdlib
 
-No framework. Go 1.22+ `http.ServeMux` supports path parameters (`/api/allowed/{username}`), which eliminates the need for chi/gorilla/echo for simple APIs.
+No framework. Go 1.22+ `http.ServeMux` supports path parameters (`/api/allowed/{username}`, `/api/instances/{id}/cancel`), which eliminates the need for chi/gorilla/echo for simple APIs.
 
 ```go
 mux := http.NewServeMux()
 mux.HandleFunc("GET /api/items", handleList)
-mux.HandleFunc("POST /api/items/{id}", handleCreate)
+mux.HandleFunc("POST /api/items/{id}/cancel", handleCancel)
+```
+
+## Subprocess: os/exec
+
+`omp -p` is the agent. We invoke it once per Telegram message via `exec.CommandContext`. Stdout is consumed as NDJSON; stderr is teed to `~/.trd/logs/<instance-id>.log`. The process group is detached (`Setpgid: true`) so SIGINT cleanly reaches every grandchild.
+
+```go
+cmd := exec.CommandContext(ctx, "omp", args...)
+cmd.Dir = inst.RepoPath
+cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+stdout, _ := cmd.StdoutPipe()
+_ = cmd.Start()
+// … scan NDJSON from stdout …
 ```
 
 ## UUID: google/uuid
 
-[github.com/google/uuid](https://pkg.go.dev/github.com/google/uuid) — standard UUID v4 generation.
+[github.com/google/uuid](https://pkg.go.dev/github.com/google/uuid) — standard UUID v4 generation for instance ids.
 
 ```go
 id := uuid.NewString() // "550e8400-e29b-41d4-a716-446655440000"
@@ -73,7 +65,7 @@ id := uuid.NewString() // "550e8400-e29b-41d4-a716-446655440000"
 
 [github.com/k2-fsa/sherpa-onnx-go](https://github.com/k2-fsa/sherpa-onnx-go) — C++ inference engine with Go bindings (CGo). Runs ONNX models for speech recognition and TTS. The shared libraries are bundled in the Go module — no system install needed.
 
-Used for: embedded whisper transcription of voice messages.
+Used for: embedded whisper transcription of voice messages, fed back to the agent as plain text in the prompt.
 
 **Why this over calling whisper CLI:** No subprocess overhead, model loaded once and reused, ~14s for 2.5 min audio on CPU.
 
@@ -92,23 +84,13 @@ text := stream.GetResult().Text
 
 ## Text-to-speech: sherpa-onnx (VITS piper)
 
-Same library as above. Runs VITS piper voice models for neural TTS.
-
-**Why this over kokoro/piper CLI:** Embedded in the binary, no Python, no subprocess, sub-200ms for short sentences on CPU.
-
-```go
-tts := sherpa.NewOfflineTts(&config)
-audio := tts.GenerateWithConfig("Hello world", &genConfig, nil)
-// audio.Samples is []float32, audio.SampleRate is int
-```
-
-**Models:** Download from [sherpa-onnx TTS models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models). We use `vits-piper-en_US-lessac-medium` (~64MB).
+Same library as above. Models are still downloadable, but outbound TTS is **not** wired in the headless port — there is no agent-side tool to invoke it. The package remains in tree as a follow-up.
 
 ## Audio codec: hraban/opus
 
 [github.com/hraban/opus](https://pkg.go.dev/github.com/hraban/opus) — Go bindings for libopus (CGo). Encode and decode Opus audio.
 
-Used for: decoding incoming Telegram voice messages (OGG/Opus → PCM) and encoding TTS output (PCM → OGG/Opus). Replaces ffmpeg entirely.
+Used for: decoding incoming Telegram voice messages (OGG/Opus → PCM). Encoding is still in the package but unused post-port.
 
 **Build dependency:** `apt install libopus-dev libopusfile-dev`
 
@@ -117,29 +99,23 @@ import "github.com/hraban/opus"
 
 dec, _ := opus.NewDecoder(48000, 1)
 n, _ := dec.Decode(packet, pcmBuffer)
-
-enc, _ := opus.NewEncoder(48000, 1, opus.AppVoIP)
-n, _ := enc.EncodeFloat32(samples, outputBuffer)
 ```
 
-## MCP SDK: @modelcontextprotocol/sdk
+## Coding agent: omp
 
-[@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk) — official MCP server SDK for TypeScript. Used by the channel plugin to expose tools and send notifications to Claude Code.
+[oh-my-pi](https://github.com/oh-my-pi/oh-my-pi) — the coding agent itself. Invoked as `omp -p --mode json --resume <session-id> <prompt>` per message. Conversation state lives in `~/.omp/agent/sessions/`; we just remember the session id per instance.
 
-```typescript
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+**Why omp:** Multi-provider (Anthropic, OpenAI, Google, etc.), structured NDJSON output mode suitable for programmatic consumption, native session-resume, no extra protocol layer needed.
 
-const server = new Server(
-  { name: "my-plugin", version: "0.1.0" },
-  { capabilities: { tools: {}, experimental: { "claude/channel": {} } } }
-);
+```bash
+npm install -g @oh-my-pi/pi-coding-agent
 ```
 
-## Process management: tmux
+## Process management: optional tmux
 
-Not a library — a system tool. Each Claude instance runs in a named tmux session (`trd-<instance-id>`). Managed via `os/exec` calls to `tmux new-session`, `tmux has-session`, `tmux kill-session`, `tmux capture-pane`, `tmux send-keys`.
+Not for agents — only for the **dispatcher itself**. The `make setup` / `make restart` targets run `trd start` inside an operator tmux session named `trd` so it survives an SSH disconnect. If you have systemd or another supervisor, you don't need tmux.
 
-**Why tmux:** Process isolation, survives SSH disconnects, pane capture for `/watch`, send-keys for auto-confirm. Already a common dev tool.
+There is no per-instance tmux in the headless port. Agents are stateless subprocesses.
 
 ## Telegram: hand-rolled net/http client
 
@@ -150,9 +126,9 @@ No third-party Telegram library. A minimal `internal/telegram` package (~300 lin
 ## Secret management
 
 No external secret store. Secrets are:
+
 - **Bot token:** env var → persisted to bbolt settings bucket.
-- **Instance secrets:** 256-bit random hex, written to `.trd/config.json` (mode 0600).
-- **All WS traffic:** localhost only (`127.0.0.1`).
+- **HTTP API:** localhost only (`127.0.0.1`); no auth.
 
 For production deployments, set env vars via your secret manager of choice and let TRD persist them to bbolt on first start.
 
@@ -160,16 +136,14 @@ For production deployments, set env vars via your secret manager of choice and l
 
 | Concern | Choice | Import/Install |
 |---------|--------|----------------|
-| Language (main) | Go 1.23 | go.dev/dl |
-| Language (plugin) | TypeScript + Bun | bun.sh |
+| Language | Go 1.23 | go.dev/dl |
 | Database | bbolt | `go.etcd.io/bbolt` |
-| WebSocket | coder/websocket | `github.com/coder/websocket` |
 | HTTP router | stdlib net/http | built-in |
 | UUID | google/uuid | `github.com/google/uuid` |
 | Speech-to-text | sherpa-onnx (whisper) | `github.com/k2-fsa/sherpa-onnx-go` |
-| Text-to-speech | sherpa-onnx (VITS piper) | same as above |
+| Text-to-speech | sherpa-onnx (VITS piper) | same as above (unused post-port) |
 | Audio codec | hraban/opus | `github.com/hraban/opus` + libopus-dev |
-| MCP server | @modelcontextprotocol/sdk | npm |
-| Process mgmt | tmux | system package |
+| Coding agent | omp | `npm i -g @oh-my-pi/pi-coding-agent` |
+| Process supervisor (operator) | tmux (optional) | system package |
 | Telegram API | hand-rolled net/http | internal package |
 | Secrets | env vars + bbolt | no external deps |

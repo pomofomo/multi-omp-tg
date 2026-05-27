@@ -37,9 +37,11 @@ type Instance struct {
 	RepoPath    string    `json:"repo_path"`
 	RepoName    string    `json:"repo_name"`
 	Secret      string    `json:"secret"`
+	SessionID   string    `json:"session_id,omitempty"` // omp session id (captured from first NDJSON line of last run)
 	State       State     `json:"state"`
 	FailCount   int       `json:"fail_count"`
 	Manager     bool      `json:"manager"`
+	Debug       bool      `json:"debug,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -131,8 +133,13 @@ func (s *Store) Put(inst Instance) error {
 		if err := byTopic.Put(topicKey(inst.ChatID, inst.TopicID), []byte(inst.InstanceID)); err != nil {
 			return err
 		}
-		if err := bySecret.Put([]byte(inst.Secret), []byte(inst.InstanceID)); err != nil {
-			return err
+		// Secret is unused after the headless-omp port (no WS auth). Older
+		// rows may still carry one; we keep the index for those, but a
+		// blank Secret on a fresh row is permitted and bypasses the index.
+		if inst.Secret != "" {
+			if err := bySecret.Put([]byte(inst.Secret), []byte(inst.InstanceID)); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

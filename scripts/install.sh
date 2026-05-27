@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# trd prerequisite check. Detects OS, tells the user how to install anything
-# missing, and does not try to be clever with sudo.
+# trd prerequisite check. Detects OS, tells the user how to install
+# anything missing, and does not try to be clever with sudo.
 #
 # Supports: Linux (Debian/Ubuntu, Fedora/RHEL, Arch), macOS (Homebrew), WSL.
 # Windows (non-WSL) is intentionally unsupported.
@@ -53,6 +53,21 @@ hint_install() {
   esac
 }
 
+# Resolve the right package name for libopus dev headers (varies by distro).
+opus_dev_package() {
+  case "$OS" in
+    darwin) echo "opus opusfile" ;;
+    linux|wsl)
+      case "$FAMILY" in
+        debian) echo "libopus-dev libopusfile-dev" ;;
+        fedora) echo "opus-devel opusfile-devel" ;;
+        arch)   echo "opus opusfile" ;;
+        *)      echo "opus opusfile (-dev/-devel as appropriate)" ;;
+      esac
+      ;;
+  esac
+}
+
 check_bin() {
   local name="$1" pkg="${2:-$1}"
   if command -v "$name" >/dev/null; then
@@ -65,49 +80,82 @@ check_bin() {
   return 1
 }
 
+# Check that pkg-config can find a library (.pc file). Returns 0 if found.
+check_pkg() {
+  local pc="$1" hint="$2"
+  if ! command -v pkg-config >/dev/null; then
+    warn "pkg-config is missing — needed to detect $pc"
+    say  "    install with:"
+    hint_install "pkg-config"
+    return 1
+  fi
+  if pkg-config --exists "$pc" 2>/dev/null; then
+    ok "$pc: $(pkg-config --modversion "$pc")"
+    return 0
+  fi
+  warn "$pc development headers are missing"
+  say  "    install with:"
+  hint_install "$hint"
+  return 1
+}
+
 missing=0
 
-check_bin git            || missing=$((missing+1))
-check_bin tmux           || missing=$((missing+1))
+check_bin git || missing=$((missing+1))
 
-# Bun is not in most distro repos. Point at the official installer.
-if command -v bun >/dev/null; then
-  ok "bun: $(command -v bun)"
+# Go is required — every make target builds the dispatcher from source.
+if command -v go >/dev/null; then
+  ok "go: $(go version | awk '{print $3}')"
 else
-  warn "bun is missing"
-  say  "    install with:"
-  say  "      curl -fsSL https://bun.sh/install | bash"
+  warn "go is missing (required to build trd)"
+  say  "    install:"
+  say  "      https://go.dev/dl/   (Go 1.22+)"
   missing=$((missing+1))
 fi
 
-# Claude Code.
-if command -v claude >/dev/null; then
-  ok "claude: $(command -v claude)"
+# CGo build dependencies for libopus (audio codec).
+check_pkg opus     "$(opus_dev_package)" || missing=$((missing+1))
+check_pkg opusfile "$(opus_dev_package)" || missing=$((missing+1))
+
+# tmux is recommended for `make setup` (keeps the dispatcher alive across
+# an SSH disconnect). Without it you'll need your own process supervisor.
+if command -v tmux >/dev/null; then
+  ok "tmux: $(command -v tmux)  (used by 'make setup' to keep trd alive)"
 else
-  warn "claude (Claude Code CLI) is missing"
-  say  "    install with:"
-  say  "      npm install -g @anthropic-ai/claude-code"
-  say  "    or see https://docs.claude.com/claude-code"
+  say "[info] tmux not found. Optional — without it, run 'trd start' under systemd or another supervisor."
+fi
+
+# omp (the headless agent). The dispatcher spawns `omp -p` per message.
+if command -v omp >/dev/null; then
+  ok "omp: $(command -v omp)"
+else
+  warn "omp (oh-my-pi agent) is missing"
+  say  "    install:"
+  say  "      npm install -g @oh-my-pi/pi-coding-agent"
+  say  "    see https://github.com/oh-my-pi/oh-my-pi"
   missing=$((missing+1))
 fi
 
-# SSH key for private repo access.
+# SSH key for private repo access (optional but very common).
 if [[ -f "$HOME/.ssh/id_ed25519" || -f "$HOME/.ssh/id_rsa" || -f "$HOME/.ssh/id_ecdsa" ]]; then
   ok "ssh key present in ~/.ssh/"
 else
   warn "no SSH private key found in ~/.ssh/"
-  say  "    generate one with:"
+  say  "    generate with:"
   say  "      ssh-keygen -t ed25519 -C \"$(whoami)@$(hostname)\""
   say  "    then add the .pub to GitHub / your git host."
-  missing=$((missing+1))
+  say  "    (not counted as missing — public repos work fine without it)"
 fi
 
-# Go (only needed to build trd from source; optional for end users).
-if command -v go >/dev/null; then
-  ok "go: $(go version | awk '{print $3}')"
-else
-  say "[info] go not found. That's fine — you only need it to build trd from source."
-fi
+# Warn (don't fail) if ~/.local/bin isn't on PATH — `make install` puts
+# the binary there.
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ok "PATH includes \$HOME/.local/bin" ;;
+  *) warn "\$HOME/.local/bin is not on \$PATH — 'trd' won't be found after install"
+     say  "    add to your shell rc:"
+     say  "      export PATH=\"\$HOME/.local/bin:\$PATH\""
+     ;;
+esac
 
 say
 if (( missing > 0 )); then
@@ -117,8 +165,6 @@ fi
 
 ok "all prerequisites satisfied"
 say
-say "Next: build trd (if developing from source)"
-say "  make build     # or: go build -o bin/trd ./cmd/trd"
-say
-say "Or install via npm (when published):"
-say "  npm install -g telegram-repo-dispatcher"
+say "Next steps:"
+say "  1. (optional) make install-models    # ~230MB of whisper + TTS models"
+say "  2. make setup TELEGRAM_BOT_TOKEN=<your-token>"
