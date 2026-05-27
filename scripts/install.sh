@@ -125,13 +125,27 @@ else
   say "[info] tmux not found. Optional — without it, run 'trd start' under systemd or another supervisor."
 fi
 
+# unzip is required by both the bun and omp installers.
+check_bin unzip || missing=$((missing+1))
+
+# bun is required by omp (the install script and runtime both need it).
+if command -v bun >/dev/null; then
+  ok "bun: $(bun --version) ($(command -v bun))"
+else
+  warn "bun is missing (required by omp)"
+  say  "    install:"
+  say  "      curl -fsSL https://bun.sh/install | bash"
+  say  "    see https://bun.sh"
+  missing=$((missing+1))
+fi
+
 # omp (the headless agent). The dispatcher spawns `omp -p` per message.
 if command -v omp >/dev/null; then
   ok "omp: $(command -v omp)"
 else
   warn "omp (oh-my-pi agent) is missing"
   say  "    install:"
-  say  "      npm install -g @oh-my-pi/pi-coding-agent"
+  say  "      curl -fsSL https://omp.sh/install | sh"
   say  "    see https://github.com/oh-my-pi/oh-my-pi"
   missing=$((missing+1))
 fi
