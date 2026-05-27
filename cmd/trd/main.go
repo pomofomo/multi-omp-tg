@@ -24,27 +24,30 @@ import (
 
 )
 
-const usage = `trd — Telegram Repo Dispatcher
+const usage = `trd — Telegram Repo Dispatcher (headless omp)
 
 Usage:
-  trd start --telegram-token <token> [--port 7777]
-  trd status
-  trd list
-  trd stop    <name-or-prefix>
-  trd watch   <name-or-prefix>
-  trd shell   <name-or-prefix>
-  trd cd      <name-or-prefix>
-  trd allow   <username>
-  trd deny    <username>
-  trd allowed
+  trd start --telegram-token <token> [--port 7777] [--debug] [--omp-bin <path>]
+  trd status                      show all instances
+  trd list                        alias for status
+  trd stop    <name-or-prefix>    cancel any in-flight agent run
+  trd watch   <name-or-prefix>    print the agent log for that instance
+  trd shell   <name-or-prefix>    open a shell in the instance's repo
+  trd cd      <name-or-prefix>    print the instance's repo path
+  trd allow   <username>          add a Telegram username to the allowlist
+  trd deny    <username>          remove a Telegram username from the allowlist
+  trd allowed                     print the allowlist
 
 <name-or-prefix> matches against repo name first, then instance ID prefix.
 
 Env:
-  TELEGRAM_BOT_TOKEN      default for --telegram-token
+  TELEGRAM_BOT_TOKEN      default for --telegram-token (persisted to bbolt)
   TRD_PORT                default for --port (7777)
-  TRD_HEALTH_INTERVAL_SEC health-loop interval (default 30)
+  TRD_DEBUG               default for --debug ("1" → enabled)
+  TRD_OMP_BIN             default omp binary (defaults to "omp" on PATH)
   TRD_ALLOWED_USERNAMES   comma-separated allowlist (merged with stored list)
+  TRD_WHISPER_MODEL_DIR   directory containing whisper models for STT
+  TRD_TTS_MODEL_DIR       directory containing VITS models for TTS
 `
 
 func main() {
@@ -87,9 +90,9 @@ var persistedEnvKeys = []string{
 	"TELEGRAM_BOT_TOKEN",
 	"TRD_WHISPER_MODEL_DIR",
 	"TRD_TTS_MODEL_DIR",
-	"TRD_CHANNEL_ENTRY",
 	"TRD_OPENAI_API_KEY",
 	"TRD_ALLOWED_USERNAMES",
+	"TRD_OMP_BIN",
 }
 
 // loadSavedSettings opens the DB, and for each persisted key where the env
@@ -121,8 +124,9 @@ func cmdStart(args []string) {
 
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	token := fs.String("telegram-token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
-	port := fs.Int("port", envInt("TRD_PORT", 7777), "dispatcher HTTP/WS port")
-	debug := fs.Bool("debug", os.Getenv("TRD_DEBUG") == "1", "enable debug logging and pass --debug to Claude instances")
+	port := fs.Int("port", envInt("TRD_PORT", 7777), "dispatcher HTTP API port")
+	debug := fs.Bool("debug", os.Getenv("TRD_DEBUG") == "1", "enable verbose dispatcher logging")
+	ompBin := fs.String("omp-bin", os.Getenv("TRD_OMP_BIN"), "path to omp binary (default: omp on PATH)")
 	_ = fs.Parse(args)
 	if *token == "" {
 		fmt.Fprintln(os.Stderr, "--telegram-token is required (or set TELEGRAM_BOT_TOKEN)")
@@ -135,6 +139,7 @@ func cmdStart(args []string) {
 		Port:          *port,
 		Logger:        logger,
 		Debug:         *debug,
+		OMPBinary:     *ompBin,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start failed:", err)
