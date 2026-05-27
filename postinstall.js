@@ -40,18 +40,21 @@ if (fs.existsSync(source)) {
 }
 
 // Fallback: build from source if go is available and cmd/trd exists.
+// trd requires cgo (sherpa-onnx, libopus) — set CGO_ENABLED=1 explicitly
+// so cross-compile-style envs don't silently produce a broken binary.
 const cmdDir = path.join(root, "cmd", "trd");
 if (fs.existsSync(cmdDir)) {
   const go = spawnSync("go", ["build", "-o", dest, "./cmd/trd"], {
     cwd: root,
     stdio: "inherit",
+    env: { ...process.env, CGO_ENABLED: "1" },
   });
   if (go.status === 0) {
     chmodx(dest);
     console.log("[trd] built from source -> bin/trd");
     process.exit(0);
   }
-  console.error("[trd] go build failed; you can build manually with: go build -o bin/trd ./cmd/trd");
+  console.error("[trd] go build failed; you can build manually with: CGO_ENABLED=1 go build -o bin/trd ./cmd/trd");
 } else {
   console.error(`[trd] no prebuilt binary for ${platform}/${arch}, and no source tree found.`);
 }

@@ -18,9 +18,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pomofomo/multi-claude-tg/internal/config"
-	"github.com/pomofomo/multi-claude-tg/internal/dispatcher"
-	"github.com/pomofomo/multi-claude-tg/internal/storage"
+	"github.com/pomofomo/multi-omp-tg/internal/config"
+	"github.com/pomofomo/multi-omp-tg/internal/dispatcher"
+	"github.com/pomofomo/multi-omp-tg/internal/storage"
 
 )
 

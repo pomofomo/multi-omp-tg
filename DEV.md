@@ -67,7 +67,7 @@ No cycles. Don't introduce them. Leaf packages (`config`, `storage`, `audio`, `t
 TRD can manage its own repo:
 
 1. Create a topic in your Telegram group.
-2. Send `/start git@github.com:you/multi-claude-tg.git` to clone your fork.
+2. Send `/start git@github.com:you/multi-omp-tg.git` to clone your fork.
 3. Talk to the agent in that topic. It edits your fork directly (the repo is cloned to `~/.trd/repos/<instance-id>`).
 4. When ready, push and `make restart` to rebuild the dispatcher with your changes.
 

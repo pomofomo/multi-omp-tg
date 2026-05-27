@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pomofomo/multi-claude-tg/internal/agent"
-	"github.com/pomofomo/multi-claude-tg/internal/storage"
-	"github.com/pomofomo/multi-claude-tg/internal/telegram"
+	"github.com/pomofomo/multi-omp-tg/internal/agent"
+	"github.com/pomofomo/multi-omp-tg/internal/storage"
+	"github.com/pomofomo/multi-omp-tg/internal/telegram"
 )
 
 // fakeRunner records every Start call and returns a fakeHandle whose

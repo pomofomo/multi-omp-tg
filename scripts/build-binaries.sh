@@ -1,24 +1,18 @@
 #!/usr/bin/env bash
-# Cross-compile trd for all supported targets into bin/.
+# Build trd for the current host.
+#
+# Cross-compile is intentionally NOT attempted here. The build depends on
+# cgo (sherpa-onnx for whisper/TTS, libopus for the audio codec), and
+# producing portable binaries needs a target-specific toolchain plus the
+# matching shared libraries on the target host. Build on each deployment
+# host instead.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 mkdir -p bin
 
-targets=(
-  "linux/amd64"
-  "linux/arm64"
-  "darwin/amd64"
-  "darwin/arm64"
-)
+echo "building bin/trd for $(go env GOOS)/$(go env GOARCH)"
+CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o bin/trd ./cmd/trd
 
-for t in "${targets[@]}"; do
-  os="${t%/*}"
-  arch="${t#*/}"
-  out="bin/trd-${os}-${arch}"
-  echo "building $out"
-  GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/trd
-done
-
-echo "done. binaries:"
-ls -lh bin/trd-*
+echo "done:"
+ls -lh bin/trd

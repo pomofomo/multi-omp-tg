@@ -21,7 +21,7 @@ import (
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 
-	"github.com/pomofomo/multi-claude-tg/internal/audio"
+	"github.com/pomofomo/multi-omp-tg/internal/audio"
 )
 
 var ErrNotConfigured = errors.New("not configured")

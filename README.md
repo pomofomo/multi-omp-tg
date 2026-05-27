@@ -20,26 +20,32 @@ Voice processing (whisper STT) and Opus audio decoding are embedded directly in 
 ## Quick start
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/pomofomo/multi-claude-tg.git
-cd multi-claude-tg
+# 1. Clone the repo
+git clone https://github.com/pomofomo/multi-omp-tg.git
+cd multi-omp-tg
 
-# 2. Check prerequisites (interactive — tells you what's missing)
+# 2. Check prerequisites (Go, libopus-dev, libopusfile-dev, omp, …).
+#    Tells you exactly what's missing for your distro.
 make install-deps
 
-# 3. Download voice models (optional, ~230MB)
+# 3. (Optional) Download voice models (~230MB)
 make install-models
 
 # 4. Create a Telegram bot:
 #    - Talk to @BotFather, /newbot, grab the token
+#    - /setprivacy → DISABLE  (so the bot can read messages in groups)
 #    - Create a supergroup with Topics enabled
-#    - Add the bot as admin
+#    - Add the bot as ADMIN  (required to read forum message_thread_id)
+#
+#    A non-admin bot will look like it "isn't seeing" your messages.
 
 # 5. Start TRD
 make setup TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 ```
 
-That's it. The dispatcher runs inside an operator tmux session named `trd` (only so it survives an SSH disconnect — agents are spawned per-message, not in tmux). Your config is saved to bbolt:
+`make setup` builds `bin/trd`, copies it to `~/.local/bin/trd`, and starts the dispatcher inside an operator tmux session named `trd` (only so it survives an SSH disconnect — agents are not in tmux). If `~/.local/bin` isn't on `$PATH`, `make install-deps` warns you — add it to your shell rc.
+
+After setup, your token is in bbolt; future starts need no env vars:
 
 ```bash
 make start              # start (reads saved config)

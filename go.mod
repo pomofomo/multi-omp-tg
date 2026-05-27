@@ -1,4 +1,4 @@
-module github.com/pomofomo/multi-claude-tg
+module github.com/pomofomo/multi-omp-tg
 
 go 1.23
 

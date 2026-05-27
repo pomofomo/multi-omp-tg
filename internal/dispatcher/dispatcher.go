@@ -32,12 +32,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/pomofomo/multi-claude-tg/internal/agent"
-	"github.com/pomofomo/multi-claude-tg/internal/api"
-	"github.com/pomofomo/multi-claude-tg/internal/config"
-	"github.com/pomofomo/multi-claude-tg/internal/media"
-	"github.com/pomofomo/multi-claude-tg/internal/storage"
-	"github.com/pomofomo/multi-claude-tg/internal/telegram"
+	"github.com/pomofomo/multi-omp-tg/internal/agent"
+	"github.com/pomofomo/multi-omp-tg/internal/api"
+	"github.com/pomofomo/multi-omp-tg/internal/config"
+	"github.com/pomofomo/multi-omp-tg/internal/media"
+	"github.com/pomofomo/multi-omp-tg/internal/storage"
+	"github.com/pomofomo/multi-omp-tg/internal/telegram"
 )
 
 // Options for Run.

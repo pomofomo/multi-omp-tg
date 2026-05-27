@@ -5,18 +5,20 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pomofomo/multi-claude-tg.git"
+    "url": "https://github.com/pomofomo/multi-omp-tg.git"
   },
   "bin": {
     "trd": "./bin/trd-shim.js"
   },
   "files": [
     "bin/trd-shim.js",
-    "bin/trd-darwin-arm64",
-    "bin/trd-darwin-amd64",
-    "bin/trd-linux-amd64",
-    "bin/trd-linux-arm64",
+    "cmd/",
+    "internal/",
+    "go.mod",
+    "go.sum",
     "scripts/install.sh",
+    "scripts/build-binaries.sh",
+    "Makefile",
     "postinstall.js",
     "README.md",
     "LICENSE"
@@ -24,7 +26,7 @@
   "scripts": {
     "postinstall": "node postinstall.js",
     "build": "bash scripts/build-binaries.sh",
-    "build:current": "go build -o bin/trd ./cmd/trd"
+    "build:current": "CGO_ENABLED=1 go build -o bin/trd ./cmd/trd"
   },
   "engines": {
     "node": ">=18"
