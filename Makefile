@@ -1,4 +1,4 @@
-.PHONY: build build-all install install-models restart setup start self-modify test tidy clean install-deps lint
+.PHONY: build build-all install install-models restart setup start test tidy clean install-deps lint
 
 GO ?= go
 
@@ -22,13 +22,19 @@ install-models:
 		tar xj --strip-components=1 -C ~/.trd/models/tts
 	@echo "Models installed to ~/.trd/models/"
 
+# Rebuild and bounce the dispatcher running in operator tmux session 'trd'.
+# Operator tmux is unrelated to per-instance agent management (which is now
+# one-shot omp subprocesses with no persistent state).
 restart: install
 	@echo "Restarting trd dispatcher in tmux session 'trd'..."
 	tmux send-keys -t trd C-c 2>/dev/null || true
 	sleep 1
 	tmux send-keys -t trd 'trd start' Enter
 
-# First-time setup: builds, installs, and starts trd in a tmux session.
+# First-time setup: builds, installs, and starts trd in an operator tmux
+# session. The tmux is purely for keeping the dispatcher process alive
+# across an SSH disconnect; agents are spawned per-message, not in tmux.
+#
 # Usage: make setup TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 setup: install
 	@if [ -z "$(TELEGRAM_BOT_TOKEN)" ]; then \
@@ -36,41 +42,17 @@ setup: install
 		echo "Get a token from @BotFather on Telegram."; \
 		exit 1; \
 	fi
-	cd channel && bun install
-	@echo "Creating tmux session 'trd'..."
+	@echo "Creating tmux session 'trd' for the dispatcher..."
 	tmux new-session -d -s trd 2>/dev/null || true
 	tmux send-keys -t trd "export TELEGRAM_BOT_TOKEN=$(TELEGRAM_BOT_TOKEN)" Enter
-	tmux send-keys -t trd "export TRD_CHANNEL_ENTRY=$(CURDIR)/channel/index.ts" Enter
 	tmux send-keys -t trd 'trd start' Enter
 	@echo ""
 	@echo "TRD is running in tmux session 'trd'."
-	@echo "  tmux attach -t trd     # see logs"
+	@echo "  tmux attach -t trd      # see logs"
 	@echo "  make restart            # rebuild + restart after code changes"
 	@echo ""
-	@echo "Your token and channel path are saved in the database."
+	@echo "Your token is saved in the database."
 	@echo "Future restarts need no env vars — just: make start"
-
-# Point TRD's channel plugin at an instance's checkout so self-edits take effect.
-# Usage: make self-modify NAME=multi-claude-tg
-self-modify: install
-	@if [ -z "$(NAME)" ]; then \
-		echo "Usage: make self-modify NAME=<instance-name>"; \
-		echo "Run 'trd list' to see instance names."; \
-		exit 1; \
-	fi
-	$(eval REPO_PATH := $(shell trd cd $(NAME) 2>/dev/null))
-	@if [ -z "$(REPO_PATH)" ]; then \
-		echo "Instance '$(NAME)' not found. Run 'trd list' to see available instances."; \
-		exit 1; \
-	fi
-	@echo "Updating TRD_CHANNEL_ENTRY to $(REPO_PATH)/channel/index.ts"
-	tmux send-keys -t trd C-c 2>/dev/null || true
-	sleep 1
-	tmux send-keys -t trd "export TRD_CHANNEL_ENTRY=$(REPO_PATH)/channel/index.ts" Enter
-	tmux send-keys -t trd 'trd start' Enter
-	@echo ""
-	@echo "Done. TRD now uses the channel plugin from instance '$(NAME)'."
-	@echo "Changes to channel/index.ts in that checkout take effect on next restart."
 
 # Start trd (reads saved config from database — no env vars needed after setup).
 start: install

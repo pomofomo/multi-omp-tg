@@ -1,15 +1,14 @@
 {
   "name": "telegram-repo-dispatcher",
-  "version": "0.1.0",
-  "description": "Talk to multiple Claude Code instances from one Telegram supergroup — each topic is a repo.",
+  "version": "0.2.0",
+  "description": "Talk to multiple omp instances from one Telegram supergroup — each topic is a repo, each message spawns omp -p.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/pomofomo/multi-claude-tg.git"
   },
   "bin": {
-    "trd": "./bin/trd-shim.js",
-    "trd-channel": "./channel/index.ts"
+    "trd": "./bin/trd-shim.js"
   },
   "files": [
     "bin/trd-shim.js",
@@ -17,13 +16,9 @@
     "bin/trd-darwin-amd64",
     "bin/trd-linux-amd64",
     "bin/trd-linux-arm64",
-    "channel/index.ts",
-    "channel/package.json",
     "scripts/install.sh",
     "postinstall.js",
     "README.md",
-    "SPEC.md",
-    "QUESTIONS.md",
     "LICENSE"
   ],
   "scripts": {
@@ -33,8 +28,5 @@
   },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }

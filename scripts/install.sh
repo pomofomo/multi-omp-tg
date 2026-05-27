@@ -67,27 +67,24 @@ check_bin() {
 
 missing=0
 
-check_bin git            || missing=$((missing+1))
-check_bin tmux           || missing=$((missing+1))
-
-# Bun is not in most distro repos. Point at the official installer.
-if command -v bun >/dev/null; then
-  ok "bun: $(command -v bun)"
+check_bin git  || missing=$((missing+1))
+# tmux is optional in the headless-omp port — only used by `make setup`
+# to keep the dispatcher running across an SSH disconnect. Recommend it
+# but don't fail without it.
+if command -v tmux >/dev/null; then
+  ok "tmux: $(command -v tmux) (optional, used by make setup)"
 else
-  warn "bun is missing"
-  say  "    install with:"
-  say  "      curl -fsSL https://bun.sh/install | bash"
-  missing=$((missing+1))
+  say "[info] tmux not found. Optional — without it, run 'trd start' under a process supervisor of your choice."
 fi
 
-# Claude Code.
-if command -v claude >/dev/null; then
-  ok "claude: $(command -v claude)"
+# omp (the headless agent). The dispatcher spawns `omp -p` per message.
+if command -v omp >/dev/null; then
+  ok "omp: $(command -v omp)"
 else
-  warn "claude (Claude Code CLI) is missing"
+  warn "omp (oh-my-pi agent) is missing"
   say  "    install with:"
-  say  "      npm install -g @anthropic-ai/claude-code"
-  say  "    or see https://docs.claude.com/claude-code"
+  say  "      npm install -g @oh-my-pi/pi-coding-agent"
+  say  "    or see https://github.com/oh-my-pi/oh-my-pi"
   missing=$((missing+1))
 fi
 
