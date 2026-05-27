@@ -1,19 +1,21 @@
 # telegram-repo-dispatcher (`trd`)
 
-Talk to multiple [Claude Code](https://docs.claude.com/claude-code) instances from one Telegram supergroup. **Each topic = one repo.** Create a topic, paste a git URL, and you're coding.
+Talk to multiple [omp](https://github.com/oh-my-pi/oh-my-pi) coding agent instances from one Telegram supergroup. **Each topic = one repo.** Create a topic, paste a git URL, and you're coding.
 
-**This project is meant to be forked and modified.** Clone it, hack on it through Telegram (yes, using TRD itself), and make it your own. PRs and issues are very welcome.
+**This project is meant to be forked and modified.** Clone it, hack on it, and make it your own. PRs and issues are very welcome.
 
 ## How it works
 
-A single Go binary connects to your Telegram bot, and for each forum topic:
+A single Go binary connects to your Telegram bot. For each forum topic bound to a repo:
 
-1. Clones a repo and launches `claude` in a tmux session.
-2. Bridges Telegram messages to Claude via an MCP channel plugin.
-3. Claude replies appear in the topic. Voice messages are transcribed; Claude can speak back.
-4. Everything persists — restart the server, and all instances reconnect automatically.
+1. The first user message clones the repo (on `/start`).
+2. Every subsequent message spawns `omp -p` in that repo, with `--resume` pointed at the omp session id captured from the previous run.
+3. omp's reply (text only, for now) is forwarded back to the topic.
+4. Voice messages are transcribed (whisper) and prefixed to the prompt; the dispatcher does not currently emit outbound voice.
 
-Voice processing (whisper STT + VITS TTS) and Opus audio encoding are embedded directly in the binary. No ffmpeg, no Python, no external CLI tools.
+There is **no persistent agent process**, no tmux per instance, no WebSocket bridge, no MCP channel plugin. Each user message is a one-shot subprocess; conversation continuity lives in omp's own session storage at `~/.omp/agent/sessions/`.
+
+Voice processing (whisper STT) and Opus audio decoding are embedded directly in the binary — no ffmpeg, no Python, no external CLI tools.
 
 ## Quick start
 
@@ -37,7 +39,7 @@ make install-models
 make setup TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 ```
 
-That's it. TRD is running in a tmux session. Your config is saved to the database — future starts need no env vars:
+That's it. The dispatcher runs inside an operator tmux session named `trd` (only so it survives an SSH disconnect — agents are spawned per-message, not in tmux). Your config is saved to bbolt:
 
 ```bash
 make start              # start (reads saved config)
@@ -52,43 +54,59 @@ In your Telegram supergroup, create a topic and send:
 /start git@github.com:you/your-repo.git
 ```
 
-Claude launches in that topic. Talk to it. Send voice messages. Everything flows through Telegram.
+The repo is cloned and bound to the topic. Then talk to it. Send voice messages. Each message spawns `omp -p` in the cloned repo, resumes the previous omp session, and forwards the reply.
 
 ### Telegram commands
 
 | Command | Effect |
 |---------|--------|
-| `/start <git-url>` | Clone repo, launch Claude |
-| `/stop` | Kill session (mapping kept) |
-| `/restart` | Resume previous conversation |
-| `/reset` | Fresh conversation (clears history) |
-| `/status` | Show tmux + channel state |
-| `/watch` | See what Claude is doing (tmux capture) |
-| `/debug` | Toggle debug mode |
-| `/forget` | Delete the mapping |
+| `/start <git-url>` | Clone repo, bind to this topic |
+| `/stop` | Cancel any in-flight run; reject new messages until `/restart` |
+| `/restart` | Re-enable the instance after `/stop` |
+| `/reset` | Forget the omp session id; next message starts fresh |
+| `/status` | Show instance, session, run state, model, thinking level |
+| `/watch` | Tail recent agent log output for this topic |
+| `/model [name]` | Show or change the model (e.g. `/model opus`) |
+| `/effort [level]` | Show or change thinking level (`minimal`, `low`, `medium`, `high`, `xhigh`) |
+| `/cancel` | Interrupt the in-flight agent run for this topic |
+| `/debug` | Toggle dispatcher debug logging |
+| `/forget` | Delete the topic-repo mapping |
+| `/help` | Show available commands |
 
 ### CLI commands
 
 ```bash
-trd list               # all instances with state
-trd watch <name>       # capture tmux pane
+trd list               # all instances with state, session id, running flag
+trd watch <name>       # tail agent log for an instance
 trd shell <name>       # open shell in repo
 trd cd <name>          # print repo path
-trd stop <name>        # kill tmux session
+trd stop <name>        # cancel any in-flight agent run
 trd allow <user>       # add to allowlist
 trd deny <user>        # remove from allowlist
 trd allowed            # show allowlist
 ```
 
+## Model / effort per repo
+
+`/model` and `/effort` write to `<repo>/.trd/agent.json`:
+
+```json
+{ "model": "opus", "thinking": "high", "updated_at": "2026-05-27T08:30:00Z" }
+```
+
+The next `omp -p` invocation in that repo passes `--model` and `--thinking` from this file. Use `/model -` or `/effort -` to clear back to omp's default.
+
 ## Voice messages
 
-Send a voice note in a topic — TRD transcribes it with embedded whisper and forwards the text to Claude. Claude can reply with voice too (`send_voice` tool).
+Send a voice note in a topic — TRD transcribes it with embedded whisper and prefixes the text to the prompt that omp receives.
 
 ```bash
 make install-models     # downloads whisper + TTS models to ~/.trd/models/
 ```
 
-Models are auto-detected at `~/.trd/models/`. No ffmpeg needed — Opus encode/decode is compiled into the binary.
+Models are auto-detected at `~/.trd/models/`. No ffmpeg needed.
+
+Outbound TTS (`send_voice`) is **not** implemented in the headless port — omp replies with text only.
 
 ## User allowlist
 
@@ -109,20 +127,20 @@ Empty allowlist = everyone allowed.
 tmux attach -t trd      # see dispatcher logs (Ctrl+B, D to detach)
 make restart            # rebuild + restart after code changes
 trd status              # check all instances
+trd watch <name>        # tail an instance's agent log
 ```
 
-Claude instances survive dispatcher restarts — the channel plugin reconnects automatically. The rate-limit watchdog auto-dismisses Claude's rate-limit prompts and notifies you in the topic.
+Conversation history survives dispatcher restarts: it lives in `~/.omp/agent/sessions/<cwd-mangled>/<session>.jsonl`, and bbolt remembers the session id. If a run is killed mid-stream the session file may stay in `.tmp` form and become unresumable — in that case `/reset` and continue.
 
 ## Developing TRD itself
 
-TRD can manage its own repo. Fork it, `/start` your fork in a topic, and have Claude modify TRD through Telegram:
+TRD can manage its own repo. Fork it, `/start` your fork in a topic, and edit it through Telegram. After your changes:
 
 ```bash
-make self-modify NAME=multi-claude-tg   # point channel plugin at instance checkout
-make restart                             # rebuild with your changes
+make restart            # rebuild and bounce the dispatcher
 ```
 
-See [DEV.md](./DEV.md) for the full developer guide, debugging, and code layout.
+See [DEV.md](./DEV.md) for the developer guide.
 
 ## Documentation
 
@@ -130,7 +148,9 @@ See [DEV.md](./DEV.md) for the full developer guide, debugging, and code layout.
 |-----|-------------|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, message flows, key decisions |
 | [DEV.md](./DEV.md) | Contributing, code layout, debugging, env vars |
-| [CLAUDE.md](./CLAUDE.md) | Key context for Claude Code when editing this repo |
+| [CLAUDE.md](./CLAUDE.md) | Key context for an agent editing this repo |
+| [TECH_STACK.md](./TECH_STACK.md) | Languages, libraries, system dependencies |
+| [porting/](./porting/) | Historical port notes (pre-headless architecture) |
 
 ## License
 

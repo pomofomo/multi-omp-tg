@@ -1,4 +1,10 @@
-# Rewrite: tmux-free subprocess architecture
+# Rewrite: tmux-free subprocess architecture (HISTORICAL)
+
+> **Status: completed.** This file was the high-level design doc for the
+> port; the implementation now lives in `internal/dispatcher`,
+> `internal/agent`, and `internal/api`. Kept for reference and for context
+> when revisiting the design.
+
 
 If we remove tmux and use `omp -p` for on-demand subprocess invocations (no persistent agent, no WebSocket bridge, no channel plugin), the architecture simplifies dramatically. This document maps the impact at a file level.
 

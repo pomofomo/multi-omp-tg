@@ -1,26 +1,32 @@
 # Architecture
 
-TRD is a Go binary that bridges a Telegram supergroup with multiple Claude Code instances. Each forum topic maps to one repo. This document explains the high-level design, message flows, and key decisions.
+TRD is a Go binary that bridges a Telegram supergroup with multiple [omp](https://github.com/oh-my-pi/oh-my-pi) coding agent invocations. Each forum topic maps to one cloned repo; each user message spawns a one-shot `omp -p` subprocess in that repo. This document explains the high-level design, message flows, and key decisions.
 
 ## System overview
 
 ```
-Telegram Supergroup                    trd (Go binary)
-├── Topic: backend   ──┐          ┌── Telegram Bot (long-poll)
-├── Topic: frontend  ──┼─────────>├── HTTP/WS server (localhost:7777)
-├── Topic: mobile    ──┤          ├── bbolt DB (~/.trd/state.db)
-└── /start <repo>    ──┘          ├── Health loop (30s)
-                                  └── tmux process manager
-                                           │
-                        ┌──────────────────┼──────────────────┐
-                    tmux: backend       tmux: frontend     tmux: mobile
-                    claude --continue   claude --continue  claude --continue
-                    (channel plugin)    (channel plugin)   (channel plugin)
-                        │                   │                  │
-                    reads .trd/         reads .trd/        reads .trd/
-                    config.json         config.json        config.json
-                    (secret+port)       (secret+port)      (secret+port)
+Telegram Supergroup                trd (Go binary)
+├── Topic: backend ──┐        ┌── Telegram Bot long-poll
+├── Topic: frontend ─┼───────>├── HTTP control plane (localhost:7777)
+├── Topic: mobile ───┤        ├── bbolt DB (~/.trd/state.db)
+└── /start <repo> ──┘         └── Per-instance FIFO run queue
+                                         │
+                              On each inbound user message:
+                                         ▼
+                              omp -p --mode json \
+                                  --resume <session-id> \
+                                  --model <model> \
+                                  --thinking <level> \
+                                  "<user text>"
+                              (cwd = ~/.trd/repos/<instance-id>)
+                                         │
+                              stdout NDJSON: session_id,
+                              message_update text_delta,
+                              message_end (final assistant text),
+                              agent_end → exit 0
 ```
+
+There is no persistent agent. The dispatcher remembers the omp session id per instance in bbolt; subsequent messages resume that session via `--resume`. Conversation history lives entirely in omp's own session storage at `~/.omp/agent/sessions/<cwd-mangled>/`.
 
 ## Three components
 
@@ -29,50 +35,51 @@ Telegram Supergroup                    trd (Go binary)
 The hub. A single long-running Go process that:
 
 - **Long-polls Telegram** for messages, routes them by `message_thread_id` to the correct instance.
-- **Serves a WebSocket endpoint** (`127.0.0.1:7777/channel`) that channel plugins connect to.
-- **Manages tmux sessions** — spawns, monitors, restarts Claude instances.
-- **Stores state in bbolt** — instance mappings, user allowlist, settings.
-- **Handles all Telegram API calls** — the channel plugin never talks to Telegram directly.
+- **Serves a small HTTP control plane** (`127.0.0.1:7777`) for the CLI (`/api/instances`, `/api/allowed/*`, `/api/instances/{id}/cancel`, `/healthz`).
+- **Spawns `omp -p` per message** via `internal/agent` and consumes its NDJSON event stream.
+- **Stores state in bbolt** — instance mappings (now including `SessionID`), user allowlist, settings.
+- **Serializes runs per instance** — a second message during an in-flight run queues FIFO and gets a 👀 reaction.
 
-### 2. Channel plugin (`channel/index.ts`)
+### 2. Agent wrapper (`internal/agent/agent.go`)
 
-A thin MCP server (~470 lines of TypeScript) that runs inside each Claude session:
+A focused 350-line package whose only job is to invoke `omp -p --mode json` and emit classified events to a Go channel. It owns:
 
-- Reads `.trd/config.json` for identity (instance_id, secret, port).
-- Opens a WebSocket to the dispatcher, authenticates with the secret.
-- Converts dispatcher frames into `claude/channel` MCP notifications.
-- Exposes tools: `reply`, `react`, `edit_message`, `download_attachment`, `send_voice`.
-- Includes behavioral instructions (acknowledge messages, reply when done, ask questions).
+- Argv assembly (`--resume`, `--model`, `--thinking`, prompt as final arg).
+- NDJSON parsing of stdout, with a 16 MB scanner buffer for long `message_update` lines.
+- `classify` — maps each line to `EvSessionID`, `EvAssistantDelta`, `EvAssistantFinal`, `EvError`, or swallows it.
+- Cancellation via SIGINT to the process group, with a grace timeout before SIGKILL.
+
+See `porting/PLAN.md` Appendix A for the exact omp NDJSON shapes.
 
 ### 3. CLI (`cmd/trd/main.go`)
 
 Subcommand dispatch for managing the dispatcher and instances:
 
 - `trd start` — runs the dispatcher.
-- `trd status/list` — shows all instances with tmux + channel state.
-- `trd stop/shell/cd/watch` — instance management.
-- `trd allow/deny/allowed` — user allowlist management.
+- `trd status` / `list` — shows all instances (state, session id, running flag).
+- `trd stop <name>` — POSTs `/api/instances/{id}/cancel` to interrupt the in-flight run.
+- `trd watch <name>` — reads `~/.trd/logs/<instance-id>.log`.
+- `trd shell` / `cd` — convenience for working in the cloned repo.
+- `trd allow` / `deny` / `allowed` — user allowlist management.
 
 ## Message flow
 
-### Inbound (Telegram → Claude)
+### A new message in a bound topic
 
 ```
 User types in Topic:backend
   → Telegram delivers Update{message, message_thread_id}
-  → Dispatcher looks up (chat_id, thread_id) → instance_id in bbolt
-  → Dispatcher pushes ws.Frame{type:"message"} to the channel plugin
-  → Channel plugin emits MCP notification "claude/channel"
-  → Claude sees the message, processes it
-```
-
-### Outbound (Claude → Telegram)
-
-```
-Claude calls reply(text, files) tool
-  → Channel plugin sends ws.Frame{type:"reply"} to dispatcher
-  → Dispatcher calls Telegram sendMessage / sendPhoto / sendVoice
-  → Message appears in the topic
+  → Dispatcher looks up (chat_id, thread_id) → Instance in bbolt
+  → buildPrompt merges text + voice transcript + attachment notes
+  → enqueueOrRun: if a run is in flight, append to pendingQueue + 👀
+                   otherwise spawn agent.Start
+  → driveAgentRun ranges over the event stream:
+      EvSessionID  → persist Instance.SessionID
+      EvDelta      → accumulate (Telegram streaming is a follow-up)
+      EvFinal      → canonical reply text
+      EvError      → annotate or replace reply
+  → After channel closes, send reply via SendMessage (splits at 4000 chars)
+  → finishRun: dispatches the next queued prompt if any
 ```
 
 ### Voice messages
@@ -82,40 +89,39 @@ User sends voice note in topic
   → Telegram delivers Update with Voice attachment
   → Dispatcher downloads OGG → Go Opus decoder → PCM
   → sherpa-onnx whisper transcribes in-process
-  → Transcript sent as frame text to Claude (audio still attached)
+  → Transcript is appended to the prompt that omp receives
 ```
 
-```
-Claude calls send_voice("text to speak")
-  → Dispatcher's sherpa-onnx VITS synthesizes PCM
-  → Go Opus encoder → OGG file
-  → Dispatcher calls Telegram sendVoice
-```
+Outbound TTS (`send_voice`) is **not** wired in the headless port. Future work.
+
+### Attachments
+
+Documents and photos are downloaded to `~/.trd/attachments/` and surfaced to omp as a trailing `[attachment: <name> (<path>)]` line in the prompt. The agent reads them via its normal `read` tool.
 
 ## Identity and persistence
 
-### First connection
+### First /start
 
 1. User sends `/start git@github.com:org/repo.git` in a topic.
-2. Dispatcher generates UUID `instance_id` + 256-bit hex `secret`.
-3. `git clone` into `~/.trd/repos/<instance-id>/`.
-4. Writes `.trd/config.json` (mode 0600) and `.mcp.json`.
-5. Spawns tmux session running `claude --continue --dangerously-skip-permissions --dangerously-load-development-channels server:trd-channel`.
-6. Stores in bbolt with three indexes: `instance_id`, `chat_id:thread_id`, `secret`.
+2. Dispatcher verifies omp is on `$PATH` (or under `TRD_OMP_BIN`).
+3. Generates UUID `instance_id`.
+4. `git clone` into `~/.trd/repos/<instance-id>/`.
+5. `EnsureGitignore` adds `.trd/` and `.omc/` to the repo's `.gitignore`.
+6. Persists `Instance{State: running, SessionID: ""}` to bbolt with three indexes (`instance_id`, `chat_id:thread_id`, `secret` — the last unused after the port).
+7. No agent process is started yet — the first user message in the topic does that.
 
-### Reconnection
+### Per-message resumption
 
-- Channel plugin reads `.trd/config.json` → same secret → connects to dispatcher → mapped to correct topic. No re-registration.
-- Dispatcher restart: `resumeInstances` relaunches dead tmux sessions. Channel plugins reconnect automatically (exponential backoff, 500ms → 10s).
-- Claude restart (`/restart`): resumes previous conversation via `--continue` flag.
-- Fresh start (`/reset`): launches Claude without `--continue`.
+- First message: `omp -p` with no `--resume` → fresh session. The session id is captured from the first NDJSON line and persisted to `Instance.SessionID`.
+- Subsequent messages: `omp -p --resume <SessionID>` → omp replays the JSONL log and appends the new turn.
+- `/reset` clears `SessionID`. The next message starts a new omp session.
+- `/forget` deletes the bbolt row but leaves the cloned repo and the omp session files on disk.
 
-### Health and auto-recovery
+### Health
 
-- Health loop runs every 30s.
-- Dead tmux sessions → restart (3 failures → `StateFailed`, notify topic).
-- Rate-limit detection → auto-dismisses prompt, notifies topic, detects recovery.
-- Attachment sweep → deletes files older than 7 days.
+There is no health loop. omp is invoked anew per message; the only thing to monitor is the dispatcher itself, which the operator does via tmux or a process supervisor.
+
+The dispatcher does sweep stale attachments older than 7 days as part of `ListInstances` — eventual, not periodic.
 
 ## Storage
 
@@ -123,38 +129,69 @@ bbolt with five buckets:
 
 | Bucket | Key | Value | Purpose |
 |--------|-----|-------|---------|
-| `instances` | instance_id | JSON Instance | Primary store |
+| `instances` | instance_id | JSON Instance (incl. SessionID) | Primary store |
 | `by_topic` | chat_id:thread_id | instance_id | Topic lookup |
-| `by_secret` | secret | instance_id | Auth lookup |
+| `by_secret` | secret | instance_id | Legacy (kept for old rows) |
 | `allowed_users` | username | "1" | User allowlist |
 | `settings` | env var name | value | Persistent config |
 
 `Put` transactionally cleans stale index entries when a row changes.
 
-## WebSocket wire protocol
+## Per-repo agent config
 
-One JSON frame per WS message. The `ws.Frame` struct is the union type.
+`<repo>/.trd/agent.json` carries per-instance model and thinking overrides:
 
-**Server → plugin:** `message`, `download_result`, `tts_result`
+```json
+{ "model": "opus", "thinking": "high", "updated_at": "2026-05-27T08:30:00Z" }
+```
 
-**Plugin → server:** `hello`, `reply`, `react`, `edit`, `download`, `tts`
+`/model` and `/effort` rewrite this file. The next `omp -p` invocation reads it and passes `--model` / `--thinking` accordingly. Empty fields = omp defaults.
+
+## HTTP API
+
+The control plane has only what the CLI needs:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/healthz` | GET | Liveness probe |
+| `/api/instances` | GET | Instance list (JSON) |
+| `/api/allowed` | GET | Allowlist |
+| `/api/allowed/{user}` | POST | Add to allowlist |
+| `/api/allowed/{user}` | DELETE | Remove from allowlist |
+| `/api/instances/{id}/cancel` | POST | Interrupt in-flight run |
+
+No WebSocket. No auth (binds to `127.0.0.1` only).
 
 ## Key design decisions
 
-- **Dispatcher does all Telegram calls.** The channel plugin is stateless — it never talks to Telegram. This means instances survive dispatcher restarts cleanly.
+- **One-shot omp per message.** No persistent agent. Simpler operational story, bounded memory, no watchdog needed.
+- **omp owns conversation continuity.** Session id captured per run, persisted in bbolt, replayed via `--resume`. No JSONL parsing on our side.
+- **Per-instance FIFO queue.** Concurrent messages in one topic are serialised so the user sees ordered replies.
+- **Dispatcher does all Telegram calls.** Inbound messages, outbound replies, voice transcription, reactions — all in the Go process.
 - **One topic = one repo.** Enforced — `/start` in an already-bound topic is rejected.
 - **Forum supergroup required.** Non-forum chats are rejected with a helpful error.
-- **Secrets in `.trd/config.json` (0600).** The secret grants impersonation. `.trd/` is auto-gitignored.
-- **WS on localhost only.** No external network exposure.
+- **HTTP API on localhost only.** No external network exposure.
 - **Env vars persisted to bbolt.** First start saves config; future restarts need no env vars.
-- **Voice processing embedded.** Whisper STT and VITS TTS run in-process via sherpa-onnx CGo bindings. No external CLI tools.
+
+## Lost vs. gained vs. headless port
+
+| Lost | Gained |
+|------|--------|
+| Persistent agent sessions ("Claude" running in tmux) | Bounded memory: zero idle processes |
+| Live TUI capture (`/watch` showed the terminal) | `/watch` reads a clean log file |
+| Manager mode (delegation between instances) | Simpler architecture; delegation can be re-added as an HTTP endpoint |
+| Outbound TTS (`send_voice` tool) | Plan documents how to re-add via a sentinel marker |
+| `/model` and `/effort` as interactive Claude commands | Per-repo `.trd/agent.json` is greppable and version-able |
+| Real-time streaming of assistant tokens | Final reply only (follow-up: stream via Telegram `editMessageText`) |
 
 ## Roadmap
 
-Open items (roughly prioritized):
+Roughly prioritized:
 
-- Auto-download inbound photos (pre-fetch instead of download_attachment dance)
-- CI / release automation (GitHub Actions → npm publish)
-- Web dashboard for monitoring instances
-- Branch-aware topics (git worktrees)
-- Remote instances via SSH
+- Streaming Telegram edits during a run (so long replies feel live).
+- Delegation between instances via `POST /api/delegate`.
+- Re-add outbound TTS — sentinel marker in assistant text → dispatcher synthesizes and sends voice.
+- Auto-download inbound photos (pre-fetch instead of attachment dance).
+- CI / release automation (GitHub Actions → npm publish).
+- Branch-aware topics (git worktrees).
+- Remote instances via SSH.

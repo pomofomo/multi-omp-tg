@@ -1,4 +1,12 @@
-# Manager Session Design
+# Manager Session Design (HISTORICAL)
+
+> **Status: not implemented in the headless-omp port.** This file
+> describes a pre-port design where a `/manager`-promoted instance could
+> delegate to other instances via dispatcher-mediated WS frames. The
+> WebSocket bridge no longer exists; delegation will be re-added as
+> `POST /api/delegate` if needed. The `Manager` field on `Instance`
+> remains in the bbolt schema for forward compatibility but is unused.
+
 
 A manager session is a Claude instance promoted with `/manager` that can orchestrate work across other TRD-managed repos. Instead of manually switching between topics, you talk to one "manager" topic and it delegates tasks to other instances, collects results, and reports progress.
 
