@@ -153,12 +153,21 @@ bbolt with five buckets:
 The dispatcher embeds a tiny TypeScript file (`internal/agent/extension/tg.ts`) into the binary and writes it to `~/.trd/ext/tg.ts` on startup. Each `omp -p` invocation is launched with:
 
 - `--extension ~/.trd/ext/tg.ts` — loads the file via omp's jiti-based extension loader.
-- `--append-system-prompt <snippet>` — short hint explaining the Telegram context and pointing at the `tg_react` tool for non-👍 reactions.
-- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL` (and optional `TRD_ACK_EMOJI`).
+- `--append-system-prompt <snippet>` — the ACKNOWLEDGE / REPLY WHEN DONE / ASK QUESTIONS interaction pattern (verbatim from the pre-port `channel/index.ts`) plus the two-mark visibility convention.
+- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`.
 
-On `agent_start` (omp's lifecycle event that fires exactly once per `-p` invocation) the extension automatically `POST`s a 👍 reaction to the dispatcher's `/api/tg/react`. The dispatcher in turn calls Telegram's `setMessageReaction`. The acknowledgement is deterministic and zero-token — no reliance on the LLM choosing to call a tool.
+The extension registers a single `tg_react(emoji)` tool. The bot token never leaves the dispatcher process; the tool POSTs `{chat_id, message_id, emoji}` to `/api/tg/react`, which then calls Telegram's `setMessageReaction`.
 
-The same extension also registers a `tg_react(emoji)` tool so the agent *can* upgrade the reaction later in the turn (e.g. 🎉 on a clear success, 😅 on a soft failure). The bot token never leaves the dispatcher process.
+### Two-mark visibility chain
+
+Every user message picks up two reactions in sequence so the sender can see exactly where the request is:
+
+| Mark | Set by | When | Meaning |
+|------|--------|------|---------|
+| 👀 | Dispatcher (deterministic, in `enqueueOrRun`) | Within ~ms of receiving the Telegram update, before `omp -p` is even spawned | "system received it" |
+| 👍 | LLM (via `tg_react` per the system prompt) | First action of the turn, before any other tool calls or text | "model has seen it" |
+
+If 👀 appears but 👍 never does, the dispatcher routed the message but the agent failed to act on it — useful diagnostic. The LLM MAY upgrade the emoji later (🎉 / 😅 / ❌) to reflect outcome.
 
 ## HTTP API
 

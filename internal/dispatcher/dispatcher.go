@@ -985,12 +985,17 @@ func (d *Dispatcher) buildPrompt(ctx context.Context, m *telegram.Message, text 
 // enough to check or mutate the maps; driveAgentRun does its own locking
 // when it later finishes.
 func (d *Dispatcher) enqueueOrRun(inst storage.Instance, p queuedPrompt) {
+	// Stage 1 of the two-mark visibility chain: the dispatcher acknowledges
+	// reception immediately, before any omp work. Stage 2 (👍) is set by the
+	// agent itself via tg_react once the LLM has actually seen the message.
+	// Together they let the user distinguish "system got it" from
+	// "model started thinking".
+	go d.sendReaction(inst.ChatID, p.msgID, "👀")
+
 	d.runMu.Lock()
 	if _, busy := d.runs[inst.InstanceID]; busy {
 		d.pendingQueue[inst.InstanceID] = append(d.pendingQueue[inst.InstanceID], p)
 		d.runMu.Unlock()
-		// Acknowledge that the message is queued behind the active run.
-		go d.sendReaction(inst.ChatID, p.msgID, "👀")
 		return
 	}
 	runCtx, cancel := context.WithTimeout(context.Background(), d.opts.RunTimeout)

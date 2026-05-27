@@ -7,28 +7,27 @@
 //   TRD_CHAT_ID         numeric Telegram chat id
 //   TRD_MESSAGE_ID      numeric id of the message that triggered this run
 //   TRD_DISPATCHER_URL  e.g. http://127.0.0.1:7777
-//   TRD_ACK_EMOJI       optional override for the auto-acknowledgement
-//                       reaction (default "👍")
 //
-// Behaviour:
+// Two-mark visibility convention:
 //
-//   - On `agent_start` we POST a 👍 reaction automatically. omp -p emits
-//     this event exactly once per invocation, so the user gets a
-//     deterministic "got it" the moment the agent starts thinking — no
-//     reliance on the LLM choosing to call a tool.
+//   👀  the dispatcher sets this BEFORE spawning omp (see enqueueOrRun)
+//       to signal "system got the message". The extension is not
+//       involved.
 //
-//   - The `tg_react` tool stays registered so the agent can still set
-//     other reactions later in the turn (e.g. 🎉 on a success, 😅 on a
-//     soft error). Self-driven calls now layer on top of the automatic
-//     ack instead of substituting for it.
+//   👍  the LLM sets this via the tg_react tool registered below, as
+//       the first action of its turn, to signal "the model has seen
+//       the message". The ACKNOWLEDGE pattern in --append-system-prompt
+//       instructs the agent to do so.
+//
+// Later in the turn the agent MAY call tg_react again with a different
+// emoji to reflect outcome (🎉 success, 😅 soft failure, ❌ hard
+// failure).
 //
 // This file is embedded in the Go binary (see extension.go) and written
 // to ~/.trd/ext/tg.ts on dispatcher startup. omp is invoked with
 // `--extension <path>` per run.
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-
-const DEFAULT_ACK_EMOJI = "👍";
 
 type Env = {
 	chatID: string;
@@ -63,45 +62,18 @@ export default function trdExtension(pi: ExtensionAPI) {
 	const z = pi.zod;
 	const env = readEnv();
 
-	// --- Automatic acknowledgement on agent_start ---------------------
-	//
-	// Fires once per `omp -p` invocation. Best-effort: a failed POST is
-	// logged and swallowed — we never block the agent on a Telegram
-	// reaction.
-	pi.on("agent_start", async () => {
-		if (!env) {
-			pi.logger?.debug?.("trd-ext: skipping auto-react, dispatcher env missing");
-			return;
-		}
-		const emoji = process.env.TRD_ACK_EMOJI || DEFAULT_ACK_EMOJI;
-		try {
-			const resp = await postReact(env, emoji);
-			if (!resp.ok) {
-				const body = await resp.text().catch(() => "");
-				pi.logger?.warn?.("trd-ext: auto-react failed", {
-					status: resp.status,
-					body,
-				});
-			}
-		} catch (err) {
-			pi.logger?.warn?.("trd-ext: auto-react errored", { err: String(err) });
-		}
-	});
-
-	// --- Self-driven tg_react tool ------------------------------------
-	//
-	// Lets the agent set additional reactions later in the turn (e.g.
-	// swap 👍 → 🎉 on success, or → 😅 on a soft failure). The automatic
-	// agent_start hook already covers the "I got your message" signal.
 	pi.registerTool({
 		name: "tg_react",
 		label: "Telegram Reaction",
 		description:
 			"Set or replace the emoji reaction on the user's current Telegram " +
-			"message. A 👍 acknowledgement is already sent automatically when " +
-			"the turn starts; use this tool only when a different emoji better " +
-			"reflects the outcome (e.g. 🎉 on success, 😅 on a soft failure). " +
-			"Argument: emoji (a single Telegram-supported emoji).",
+			"message. Call this once at the start of every turn with \"👍\" to " +
+			"signal that you have seen the message (the dispatcher's own 👀 " +
+			"only signals that the system received it, not that the model has " +
+			"read it). Later you MAY call this tool again with a different " +
+			"emoji to reflect the outcome (e.g. 🎉 success, 😅 soft failure, " +
+			"❌ hard failure). Argument: emoji (a single Telegram-supported " +
+			"emoji).",
 		parameters: z.object({
 			emoji: z.string().describe("Single emoji, e.g. 👍"),
 		}),

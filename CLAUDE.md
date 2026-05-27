@@ -65,14 +65,14 @@ See `porting/PLAN.md` Appendix A for the source NDJSON shapes.
 
 ## Conventions
 
-- **One run per instance at a time.** A second message while a run is in flight queues FIFO until the first finishes; the queued message gets a 👀 reaction.
+- **Two-mark visibility on every user message.** The dispatcher sets 👀 in `enqueueOrRun` (deterministic, before any agent work); the LLM is instructed via the system prompt to call `tg_react("👍")` as its first action ("model has seen it"). The LLM MAY later upgrade to 🎉 / 😅 / ❌. The pre-port queued-message 👀 still works (it's now just a special case of the universal mark).
 - **omp is spawned per message.** Don't reintroduce a persistent agent without RFC.
 - **Session id is captured from the first NDJSON line.** Pass it as `--resume` on subsequent runs in that instance.
 - **`<repo>/.trd/agent.json`** is the source of truth for per-instance model/thinking overrides.
 - **`.trd/` is auto-gitignored** in cloned repos.
 - **CGo required** for sherpa-onnx (whisper + TTS) and libopus (audio codec).
 - **Env vars are persisted** to bbolt settings bucket on first start. Future restarts read from DB.
-- **omp gets a TS extension per spawn.** `internal/agent/extension/tg.ts` is embedded into the binary and written to `~/.trd/ext/tg.ts` on dispatcher start. Each `omp -p` run is invoked with `--extension <path>` + `--append-system-prompt <snippet>` and per-spawn env (`TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`). The extension auto-fires 👍 on `agent_start` (deterministic, zero-token) and also registers a `tg_react(emoji)` tool so the agent can upgrade the reaction later.
+- **omp gets a TS extension per spawn.** `internal/agent/extension/tg.ts` is embedded into the binary and written to `~/.trd/ext/tg.ts` on dispatcher start. Each `omp -p` run is invoked with `--extension <path>` + `--append-system-prompt <snippet>` and per-spawn env (`TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`). The extension registers a `tg_react(emoji)` tool; there is no automatic agent-side reaction (👀 lives on the dispatcher side).
 - **Graceful shutdown.** On SIGINT/SIGTERM the dispatcher calls `Shutdown(5s)`: SIGINTs each in-flight omp child's pgid in parallel, waits for them to drain (SIGKILL on timeout), then waits for the `driveAgentRun` goroutines so the final Telegram reply lands before the process exits. Pending queued prompts are dropped.
 
 ## Debugging

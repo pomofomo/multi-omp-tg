@@ -276,6 +276,44 @@ func TestQueueWhileBusy(t *testing.T) {
 	drainHandle(t, d, inst.InstanceID, r.pendingAt(1))
 }
 
+func TestEyesReactionFiresOnEveryEnqueue(t *testing.T) {
+	// Both the immediate-spawn path AND the queued path MUST set 👀, so
+	// the sender sees the dispatcher's "got it" mark regardless of whether
+	// the agent is already busy. The LLM is expected to layer 👍 on top
+	// via tg_react once it has actually read the message.
+	r := &fakeRunner{} // first run hangs so we can also test queue path
+	d, rec := newTestDispatcher(t, r)
+
+	inst := storage.Instance{InstanceID: "ieyes", ChatID: 7, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 7, thread: 1, msgID: 100, text: "a"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 7, thread: 1, msgID: 101, text: "b"})
+
+	waitFor(t, 2*time.Second, func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return len(rec.reactions) >= 2
+	})
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.reactions) < 2 {
+		t.Fatalf("expected ≥2 reactions; got %d", len(rec.reactions))
+	}
+	seen := map[int]string{}
+	for _, r := range rec.reactions {
+		seen[r.msgID] = r.emoji
+	}
+	for _, msgID := range []int{100, 101} {
+		if seen[msgID] != "👀" {
+			t.Errorf("msg %d should have 👀 from dispatcher; got %q (all=%v)", msgID, seen[msgID], rec.reactions)
+		}
+	}
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+}
+
 func TestCancelRunInterruptsActive(t *testing.T) {
 	r := &fakeRunner{emit: []agent.Event{{Kind: agent.EvAssistantFinal, Text: "done"}}}
 	d, _ := newTestDispatcher(t, r)

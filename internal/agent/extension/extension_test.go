@@ -73,8 +73,8 @@ func TestSourceMentionsTgReact(t *testing.T) {
 	if !bytes.Contains(Source(), []byte("tg_react")) {
 		t.Errorf("embedded extension is missing the tg_react tool name")
 	}
-	if !bytes.Contains(Source(), []byte("agent_start")) {
-		t.Errorf("embedded extension is missing the agent_start auto-react hook")
+	if bytes.Contains(Source(), []byte("agent_start")) {
+		t.Errorf("embedded extension must not auto-fire on agent_start anymore — the dispatcher owns the 👀 mark; the LLM owns 👍 via tg_react")
 	}
 	if !bytes.Contains(Source(), []byte("/api/tg/react")) {
 		t.Errorf("embedded extension is missing the dispatcher endpoint path")
@@ -88,17 +88,20 @@ func TestSystemPromptAppend(t *testing.T) {
 	if !bytes.Contains(body, []byte("\n")) {
 		t.Errorf("SystemPromptAppend must contain a newline to avoid file-path probing")
 	}
-	// Restored from the pre-port channel/index.ts ACKNOWLEDGE pattern —
-	// keep the imperative phrasing so the LLM gets a clear instruction
-	// independent of the deterministic agent_start backstop.
+	// Pattern restored from the pre-port channel/index.ts ACKNOWLEDGE
+	// instruction, plus the new two-mark visibility chain (dispatcher 👀
+	// + LLM 👍 via tg_react).
 	for _, want := range []string{
 		"ACKNOWLEDGE",
-		"react with 👍",
-		"BEFORE you start processing",
+		"FIRST action",
+		"emoji \"👍\"",
 		"voice messages which arrive after transcription delay",
 		"tg_react",
 		"REPLY WHEN DONE",
 		"ASK QUESTIONS",
+		"system received it",
+		"model has seen it",
+		"👀",
 	} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Errorf("SystemPromptAppend missing required phrase %q", want)
