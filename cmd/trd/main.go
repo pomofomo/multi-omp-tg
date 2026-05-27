@@ -154,8 +154,13 @@ func cmdStart(args []string) {
 	defer cancel()
 
 	logger.Info("trd started", "port", *port)
-	if err := d.Run(ctx); err != nil {
-		logger.Error("run", "err", err)
+	runErr := d.Run(ctx)
+	// Drain in-flight omp children cleanly before the deferred Close
+	// tears down the pipes underneath them — otherwise the children
+	// would EPIPE on their next stdout write.
+	d.Shutdown(5 * time.Second)
+	if runErr != nil {
+		logger.Error("run", "err", runErr)
 		os.Exit(1)
 	}
 	logger.Info("trd stopped")

@@ -38,6 +38,10 @@ type Handler interface {
 	// CancelRun interrupts any in-flight agent invocation for the given
 	// instance id (or prefix). Returns nil if there was nothing to cancel.
 	CancelRun(instanceIDOrPrefix string) error
+	// ReactToMessage adds an emoji reaction to a Telegram message. Used
+	// by the in-process omp extension (see internal/agent/extension) so
+	// the agent can 👍 a freshly-received user message.
+	ReactToMessage(chatID int64, messageID int, emoji string) error
 }
 
 // Server serves the dispatcher's HTTP endpoints.
@@ -64,6 +68,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("POST /api/allowed/{username}", s.handleAPIAllowedAdd)
 	mux.HandleFunc("DELETE /api/allowed/{username}", s.handleAPIAllowedRemove)
 	mux.HandleFunc("POST /api/instances/{id}/cancel", s.handleAPIInstanceCancel)
+	mux.HandleFunc("POST /api/tg/react", s.handleAPIReact)
 
 	s.srv = &http.Server{
 		Addr:              s.addr,
@@ -152,6 +157,27 @@ func (s *Server) handleAPIInstanceCancel(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.h.CancelRun(id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAPIReact(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ChatID    int64  `json:"chat_id"`
+		MessageID int    `json:"message_id"`
+		Emoji     string `json:"emoji"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.ChatID == 0 || body.MessageID == 0 || body.Emoji == "" {
+		http.Error(w, "chat_id, message_id, and emoji are required", http.StatusBadRequest)
+		return
+	}
+	if err := s.h.ReactToMessage(body.ChatID, body.MessageID, body.Emoji); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

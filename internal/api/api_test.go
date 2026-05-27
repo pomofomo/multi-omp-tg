@@ -22,6 +22,8 @@ type fakeHandler struct {
 	rmErr     error
 	cancelled []string
 	cancelErr error
+	reactions []reactEvent
+	reactErr  error
 }
 
 func (h *fakeHandler) ListInstances() ([]byte, error) {
@@ -74,6 +76,22 @@ func (h *fakeHandler) CancelRun(id string) error {
 		return h.cancelErr
 	}
 	h.cancelled = append(h.cancelled, id)
+	return nil
+}
+
+type reactEvent struct {
+	chatID    int64
+	messageID int
+	emoji     string
+}
+
+func (h *fakeHandler) ReactToMessage(chatID int64, messageID int, emoji string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.reactErr != nil {
+		return h.reactErr
+	}
+	h.reactions = append(h.reactions, reactEvent{chatID: chatID, messageID: messageID, emoji: emoji})
 	return nil
 }
 
@@ -256,6 +274,77 @@ func TestInstanceCancelError(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost, base+"/api/instances/missing/cancel", nil)
 	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+}
+
+func TestReactEndpoint(t *testing.T) {
+	h := &fakeHandler{}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	body := strings.NewReader(`{"chat_id":42,"message_id":7,"emoji":"👍"}`)
+	resp, err := http.Post(base+"/api/tg/react", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, raw)
+	}
+	if len(h.reactions) != 1 {
+		t.Fatalf("reactions: %v", h.reactions)
+	}
+	got := h.reactions[0]
+	if got.chatID != 42 || got.messageID != 7 || got.emoji != "👍" {
+		t.Errorf("react payload: %+v", got)
+	}
+}
+
+func TestReactEndpointValidatesBody(t *testing.T) {
+	h := &fakeHandler{}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing emoji", `{"chat_id":1,"message_id":2}`},
+		{"missing chat_id", `{"message_id":2,"emoji":"👍"}`},
+		{"missing message_id", `{"chat_id":1,"emoji":"👍"}`},
+		{"invalid json", `not-json`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(base+"/api/tg/react", "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status: want 400, got %d", resp.StatusCode)
+			}
+		})
+	}
+	if len(h.reactions) != 0 {
+		t.Errorf("handler was called with invalid payloads: %v", h.reactions)
+	}
+}
+
+func TestReactEndpointPropagatesError(t *testing.T) {
+	h := &fakeHandler{reactErr: errors.New("telegram down")}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	body := strings.NewReader(`{"chat_id":1,"message_id":2,"emoji":"👍"}`)
+	resp, err := http.Post(base+"/api/tg/react", "application/json", body)
 	if err != nil {
 		t.Fatal(err)
 	}

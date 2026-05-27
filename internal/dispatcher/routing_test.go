@@ -369,6 +369,183 @@ func TestErrorEventSurfacesAsTelegramMessage(t *testing.T) {
 	}
 }
 
+func TestExtensionWiringPropagatedToAgent(t *testing.T) {
+	r := &fakeRunner{emit: []agent.Event{{Kind: agent.EvAssistantFinal, Text: "ok"}}}
+	d, _ := newTestDispatcher(t, r)
+	d.extPath = "/fake/ext/tg.ts"
+	d.opts.Port = 9999
+
+	inst := storage.Instance{InstanceID: "iext", ChatID: 1, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 42, thread: 1, msgID: 7, text: "x"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+
+	got := r.lastCall()
+	if len(got.Extensions) != 1 || got.Extensions[0] != "/fake/ext/tg.ts" {
+		t.Errorf("Extensions: got %v", got.Extensions)
+	}
+	if got.AppendSystemPrompt == "" {
+		t.Errorf("AppendSystemPrompt should be populated when extension is wired")
+	}
+	wantEnv := []string{
+		"TRD_CHAT_ID=42",
+		"TRD_MESSAGE_ID=7",
+		"TRD_DISPATCHER_URL=http://127.0.0.1:9999",
+	}
+	for _, w := range wantEnv {
+		found := false
+		for _, e := range got.ExtraEnv {
+			if e == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("ExtraEnv missing %q; got %v", w, got.ExtraEnv)
+		}
+	}
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+}
+
+func TestExtensionWiringOmittedWhenNoExtension(t *testing.T) {
+	r := &fakeRunner{emit: []agent.Event{{Kind: agent.EvAssistantFinal, Text: "ok"}}}
+	d, _ := newTestDispatcher(t, r)
+	// extPath deliberately left empty.
+
+	inst := storage.Instance{InstanceID: "inoext", ChatID: 1, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 1, text: "x"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+
+	got := r.lastCall()
+	if len(got.Extensions) != 0 || got.AppendSystemPrompt != "" || len(got.ExtraEnv) != 0 {
+		t.Errorf("extension wiring leaked into options when extPath was empty: %+v", got)
+	}
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+}
+
+func TestReactToMessageCallsSetReaction(t *testing.T) {
+	r := &fakeRunner{}
+	d, rec := newTestDispatcher(t, r)
+
+	if err := d.ReactToMessage(1234, 56, "👍"); err != nil {
+		t.Fatalf("ReactToMessage: %v", err)
+	}
+	if len(rec.reactions) != 1 {
+		t.Fatalf("expected 1 reaction; got %v", rec.reactions)
+	}
+	got := rec.reactions[0]
+	if got.chatID != 1234 || got.msgID != 56 || got.emoji != "👍" {
+		t.Errorf("reaction: %+v", got)
+	}
+}
+
+func TestReactToMessageRejectsZeroArgs(t *testing.T) {
+	r := &fakeRunner{}
+	d, _ := newTestDispatcher(t, r)
+	for _, tc := range []struct {
+		name              string
+		chat              int64
+		msg               int
+		emoji             string
+	}{
+		{"zero chat", 0, 1, "👍"},
+		{"zero msg", 1, 0, "👍"},
+		{"empty emoji", 1, 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := d.ReactToMessage(tc.chat, tc.msg, tc.emoji); err == nil {
+				t.Errorf("expected error for %s; got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestShutdownCancelsInFlightRuns(t *testing.T) {
+	r := &fakeRunner{} // No initial events: the run "hangs" until Cancel.
+	d, _ := newTestDispatcher(t, r)
+
+	inst := storage.Instance{InstanceID: "isd", ChatID: 1, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 1, text: "x"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+
+	handle := r.pendingAt(0)
+	if handle == nil {
+		t.Fatal("no handle produced")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		d.Shutdown(time.Second)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown did not return within 3s")
+	}
+	if !handle.cancelled.Load() {
+		t.Errorf("handle.Cancel was not invoked during Shutdown")
+	}
+	// driveAgentRun must have returned; runs map clear.
+	d.runMu.Lock()
+	defer d.runMu.Unlock()
+	if len(d.runs) != 0 {
+		t.Errorf("runs map not drained: %d entries", len(d.runs))
+	}
+}
+
+func TestShutdownDropsQueuedPrompts(t *testing.T) {
+	r := &fakeRunner{} // First run hangs.
+	d, _ := newTestDispatcher(t, r)
+
+	inst := storage.Instance{InstanceID: "iq", ChatID: 1, TopicID: 1, RepoPath: t.TempDir(), State: storage.StateRunning}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 1, text: "first"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+
+	// Two more prompts queue up behind the in-flight first run.
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 2, text: "second"})
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 3, text: "third"})
+
+	d.runMu.Lock()
+	if got := len(d.pendingQueue[inst.InstanceID]); got != 2 {
+		d.runMu.Unlock()
+		t.Fatalf("expected 2 queued prompts; got %d", got)
+	}
+	d.runMu.Unlock()
+
+	d.Shutdown(time.Second)
+
+	// After Shutdown, finishRun's queue-drain must NOT have respawned the
+	// queued prompts; the runner should still show only the first call.
+	if r.callCount() != 1 {
+		t.Errorf("queued prompts were respawned during shutdown: callCount=%d", r.callCount())
+	}
+	d.runMu.Lock()
+	defer d.runMu.Unlock()
+	if got := len(d.pendingQueue[inst.InstanceID]); got != 0 {
+		t.Errorf("pendingQueue not cleared: %d remain", got)
+	}
+}
+
+func TestShutdownIsNoopWhenIdle(t *testing.T) {
+	r := &fakeRunner{}
+	d, _ := newTestDispatcher(t, r)
+
+	start := time.Now()
+	d.Shutdown(5 * time.Second)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Errorf("Shutdown blocked %v with no in-flight work; want near-zero", elapsed)
+	}
+}
+
 // --- helpers ---
 
 func writeAgentJSON(t *testing.T, repoPath, body string) error {

@@ -33,6 +33,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/pomofomo/multi-omp-tg/internal/agent"
+	"github.com/pomofomo/multi-omp-tg/internal/agent/extension"
 	"github.com/pomofomo/multi-omp-tg/internal/api"
 	"github.com/pomofomo/multi-omp-tg/internal/config"
 	"github.com/pomofomo/multi-omp-tg/internal/media"
@@ -105,12 +106,20 @@ type Dispatcher struct {
 	sendMessage func(ctx context.Context, p telegram.SendMessageParams) (telegram.Message, error)
 	setReaction func(ctx context.Context, chatID int64, msgID int, emoji string) error
 
+	// extPath is the absolute path of the embedded omp extension that
+	// registers TRD's Telegram-aware tools (tg_react). Populated by New
+	// via extension.Ensure; empty disables the extension.
+	extPath string
+
 	// In-flight agent runs and per-instance pending queues. The dispatcher
 	// serialises invocations per instance: a topic always sees its agent's
 	// reply to message N before message N+1 is sent.
 	runMu        sync.Mutex
 	runs         map[string]*agentRun
 	pendingQueue map[string][]queuedPrompt
+	// runWG tracks in-flight driveAgentRun goroutines so Shutdown can
+	// wait for them to drain cleanly before the process exits.
+	runWG sync.WaitGroup
 }
 
 // agentRun is the live handle for an `omp -p` invocation. Created by
@@ -201,6 +210,14 @@ func New(opts Options) (*Dispatcher, error) {
 	}
 	d.sendMessage = d.tg.SendMessage
 	d.setReaction = d.tg.SetReaction
+	if root, err := config.Root(); err == nil {
+		extPath, err := extension.Ensure(root)
+		if err != nil {
+			opts.Logger.Warn("extension.Ensure failed; tg_react tool will be unavailable", "err", err)
+		} else {
+			d.extPath = extPath
+		}
+	}
 	d.api = api.New(fmt.Sprintf("127.0.0.1:%d", opts.Port), opts.Logger, d)
 	return d, nil
 }
@@ -209,6 +226,61 @@ func New(opts Options) (*Dispatcher, error) {
 func (d *Dispatcher) Close() error {
 	d.media.Close()
 	return d.store.Close()
+}
+
+// Shutdown gracefully drains every in-flight omp run before the process
+// exits. It SIGINTs each child's process group, blocks for up to grace
+// per child (in parallel) for a clean exit, SIGKILLs stragglers, then
+// waits for the driveAgentRun goroutines themselves to return so their
+// final Telegram replies make it out before the dispatcher closes its
+// stdout pipe.
+//
+// Idempotent and safe to call concurrently with Run returning. Pending
+// queued prompts are dropped (they would otherwise spawn new omp runs
+// during shutdown).
+func (d *Dispatcher) Shutdown(grace time.Duration) {
+	d.runMu.Lock()
+	handles := make([]agentHandle, 0, len(d.runs))
+	for _, run := range d.runs {
+		if run.handle != nil {
+			handles = append(handles, run.handle)
+		}
+	}
+	dropped := 0
+	for id, q := range d.pendingQueue {
+		dropped += len(q)
+		delete(d.pendingQueue, id)
+	}
+	d.runMu.Unlock()
+
+	if len(handles) == 0 && dropped == 0 {
+		return
+	}
+	d.logger.Info("shutdown: draining in-flight runs",
+		"active", len(handles), "dropped_queued", dropped, "grace", grace)
+
+	// SIGINT each child in parallel so total wait is bounded by grace,
+	// not grace*N. Cancel internally waits for the process to exit (then
+	// SIGKILLs on timeout), so by the time wg.Wait returns omp is gone.
+	var wg sync.WaitGroup
+	for _, h := range handles {
+		wg.Add(1)
+		go func(h agentHandle) {
+			defer wg.Done()
+			h.Cancel(grace)
+		}(h)
+	}
+	wg.Wait()
+
+	// driveAgentRun is still draining its event channel and may be
+	// mid-SendMessage. Wait for those to finish so the last reply lands.
+	done := make(chan struct{})
+	go func() { d.runWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(grace + 5*time.Second):
+		d.logger.Warn("shutdown: driveAgentRun goroutines did not finish within grace")
+	}
 }
 
 // --- api.Handler implementation ---
@@ -228,6 +300,25 @@ func (d *Dispatcher) ListInstances() ([]byte, error) {
 		infos[i] = InstanceInfo{Instance: inst, Running: running}
 	}
 	return json.Marshal(infos)
+}
+
+// ReactToMessage implements api.Handler. It is invoked from the localhost
+// HTTP endpoint POST /api/tg/react when the in-process omp extension
+// calls its tg_react tool. Synchronous (the agent waits for the call) but
+// bounded by a short timeout: we don't want a misbehaving Telegram API
+// to stall the agent's first turn.
+func (d *Dispatcher) ReactToMessage(chatID int64, messageID int, emoji string) error {
+	if chatID == 0 || messageID == 0 || emoji == "" {
+		return errors.New("react: chat_id, message_id, and emoji are required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.setReaction(ctx, chatID, messageID, emoji); err != nil {
+		d.logger.Debug("react via api failed", "chat", chatID, "msg_id", messageID, "err", err)
+		return err
+	}
+	d.logger.Debug("react via api", "chat", chatID, "msg_id", messageID, "emoji", emoji)
+	return nil
 }
 
 // AllowedUsers returns the stored allowlist.
@@ -914,7 +1005,11 @@ func (d *Dispatcher) enqueueOrRun(inst storage.Instance, p queuedPrompt) {
 	d.runs[inst.InstanceID] = run
 	d.runMu.Unlock()
 
-	go d.driveAgentRun(runCtx, inst, run, p)
+	d.runWG.Add(1)
+	go func() {
+		defer d.runWG.Done()
+		d.driveAgentRun(runCtx, inst, run, p)
+	}()
 }
 
 // driveAgentRun is the per-message worker goroutine. It spawns omp, ranges
@@ -928,14 +1023,30 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 	agentCfg, _ := config.ReadAgentConfig(inst.RepoPath)
 	logPath, _ := config.InstanceLogPath(inst.InstanceID)
 
+	var extensions []string
+	var sysPromptAppend string
+	var extraEnv []string
+	if d.extPath != "" {
+		extensions = []string{d.extPath}
+		sysPromptAppend = extension.SystemPromptAppend
+		extraEnv = []string{
+			fmt.Sprintf("TRD_CHAT_ID=%d", p.chatID),
+			fmt.Sprintf("TRD_MESSAGE_ID=%d", p.msgID),
+			fmt.Sprintf("TRD_DISPATCHER_URL=http://127.0.0.1:%d", d.opts.Port),
+		}
+	}
+
 	h, err := d.runner.Start(ctx, agent.RunOptions{
-		Cwd:       inst.RepoPath,
-		SessionID: inst.SessionID,
-		Model:     agentCfg.Model,
-		Thinking:  agentCfg.Thinking,
-		Prompt:    p.text,
-		LogPath:   logPath,
-		Binary:    d.opts.OMPBinary,
+		Cwd:                inst.RepoPath,
+		SessionID:          inst.SessionID,
+		Model:              agentCfg.Model,
+		Thinking:           agentCfg.Thinking,
+		Prompt:             p.text,
+		LogPath:            logPath,
+		Binary:             d.opts.OMPBinary,
+		Extensions:         extensions,
+		AppendSystemPrompt: sysPromptAppend,
+		ExtraEnv:           extraEnv,
 	})
 	if err != nil {
 		d.logger.Error("agent.Start failed",

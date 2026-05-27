@@ -147,6 +147,19 @@ bbolt with five buckets:
 
 `/model` and `/effort` rewrite this file. The next `omp -p` invocation reads it and passes `--model` / `--thinking` accordingly. Empty fields = omp defaults.
 
+
+## omp extension (tools injected into the agent)
+
+The dispatcher embeds a tiny TypeScript file (`internal/agent/extension/tg.ts`) into the binary and writes it to `~/.trd/ext/tg.ts` on startup. Each `omp -p` invocation is launched with:
+
+- `--extension ~/.trd/ext/tg.ts` — loads the file via omp's jiti-based extension loader.
+- `--append-system-prompt <snippet>` — short hint explaining the Telegram context and pointing at the `tg_react` tool for non-👍 reactions.
+- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL` (and optional `TRD_ACK_EMOJI`).
+
+On `agent_start` (omp's lifecycle event that fires exactly once per `-p` invocation) the extension automatically `POST`s a 👍 reaction to the dispatcher's `/api/tg/react`. The dispatcher in turn calls Telegram's `setMessageReaction`. The acknowledgement is deterministic and zero-token — no reliance on the LLM choosing to call a tool.
+
+The same extension also registers a `tg_react(emoji)` tool so the agent *can* upgrade the reaction later in the turn (e.g. 🎉 on a clear success, 😅 on a soft failure). The bot token never leaves the dispatcher process.
+
 ## HTTP API
 
 The control plane has only what the CLI needs:
@@ -159,6 +172,7 @@ The control plane has only what the CLI needs:
 | `/api/allowed/{user}` | POST | Add to allowlist |
 | `/api/allowed/{user}` | DELETE | Remove from allowlist |
 | `/api/instances/{id}/cancel` | POST | Interrupt in-flight run |
+| `/api/tg/react` | POST | Add an emoji reaction to a Telegram message (used by the omp `tg_react` tool) |
 
 No WebSocket. No auth (binds to `127.0.0.1` only).
 

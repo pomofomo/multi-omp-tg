@@ -425,6 +425,117 @@ func TestStartArgvOmitsBlanks(t *testing.T) {
 	}
 }
 
+func TestStartArgvIncludesExtensionsAndAppendSystemPrompt(t *testing.T) {
+	t.Setenv(helperEnv, "happy")
+	dir := t.TempDir()
+	r, err := Start(context.Background(), RunOptions{
+		Cwd:                dir,
+		Prompt:             "hi",
+		Binary:             helperBinary(t),
+		Extensions:         []string{"/tmp/a.ts", "/tmp/b.ts"},
+		AppendSystemPrompt: "extra\nprompt",
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	for range r.Events() {
+	}
+	args := r.Cmd().Args
+	// Confirm flag order: --extension <path> appears once per entry, in
+	// declared order, then --append-system-prompt <value>, then prompt.
+	wantPairs := [][2]string{
+		{"--extension", "/tmp/a.ts"},
+		{"--extension", "/tmp/b.ts"},
+		{"--append-system-prompt", "extra\nprompt"},
+	}
+	for _, p := range wantPairs {
+		found := false
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == p[0] && args[i+1] == p[1] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("argv missing %q %q; got %v", p[0], p[1], args)
+		}
+	}
+	if args[len(args)-1] != "hi" {
+		t.Errorf("prompt must remain final arg; got %v", args)
+	}
+}
+
+func TestStartArgvOmitsExtensionAndAppendSystemPromptWhenUnset(t *testing.T) {
+	t.Setenv(helperEnv, "happy")
+	dir := t.TempDir()
+	r, err := Start(context.Background(), RunOptions{
+		Cwd: dir, Prompt: "hi", Binary: helperBinary(t),
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	for range r.Events() {
+	}
+	args := r.Cmd().Args
+	for _, bad := range []string{"--extension", "--append-system-prompt"} {
+		if contains(args, bad) {
+			t.Errorf("flag %q must be omitted when unset; got %v", bad, args)
+		}
+	}
+}
+
+func TestStartExtraEnvAppendedToChildEnv(t *testing.T) {
+	t.Setenv(helperEnv, "happy")
+	dir := t.TempDir()
+	r, err := Start(context.Background(), RunOptions{
+		Cwd:      dir,
+		Prompt:   "hi",
+		Binary:   helperBinary(t),
+		ExtraEnv: []string{"TRD_TEST_KEY=value1", "TRD_TEST_OTHER=value2"},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	for range r.Events() {
+	}
+	env := r.Cmd().Env
+	if env == nil {
+		t.Fatalf("ExtraEnv set but cmd.Env was left nil (would inherit parent without overrides)")
+	}
+	for _, want := range []string{"TRD_TEST_KEY=value1", "TRD_TEST_OTHER=value2"} {
+		if !contains(env, want) {
+			t.Errorf("env missing %q; tail: %v", want, env[max(0, len(env)-6):])
+		}
+	}
+	// Parent's PATH should still be present — ExtraEnv augments, not replaces.
+	hasPath := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			hasPath = true
+			break
+		}
+	}
+	if !hasPath {
+		t.Errorf("ExtraEnv must augment os.Environ(), not replace it; PATH missing")
+	}
+}
+
+func TestStartExtraEnvLeavesEnvNilWhenEmpty(t *testing.T) {
+	t.Setenv(helperEnv, "happy")
+	dir := t.TempDir()
+	r, err := Start(context.Background(), RunOptions{
+		Cwd: dir, Prompt: "hi", Binary: helperBinary(t),
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	for range r.Events() {
+	}
+	if r.Cmd().Env != nil {
+		t.Errorf("cmd.Env must remain nil when ExtraEnv is empty so the child inherits parent env normally; got %v", r.Cmd().Env)
+	}
+}
+
 func TestStartMissingCwd(t *testing.T) {
 	_, err := Start(context.Background(), RunOptions{Prompt: "x"})
 	if err == nil {

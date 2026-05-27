@@ -108,6 +108,21 @@ type RunOptions struct {
 	// Binary overrides the omp executable path. Empty falls back to
 	// $TRD_OMP_BIN then "omp" on PATH.
 	Binary string
+	// Extensions are forwarded as repeated `--extension <path>` flags.
+	// Each path MUST point to a TypeScript file omp can load via jiti.
+	// The TRD dispatcher uses this to inject its Telegram-aware tools
+	// (see internal/agent/extension).
+	Extensions []string
+	// AppendSystemPrompt is forwarded as `--append-system-prompt <value>`.
+	// omp resolves a single-line value as a file path before falling
+	// back to literal text — keep a newline in the value when you want
+	// the literal-text path.
+	AppendSystemPrompt string
+	// ExtraEnv are extra `KEY=VALUE` entries appended on top of the
+	// parent process environment for the spawned omp. The dispatcher
+	// uses this to surface TRD_CHAT_ID / TRD_MESSAGE_ID /
+	// TRD_DISPATCHER_URL to the tg_react tool.
+	ExtraEnv []string
 	// ExtraArgs are appended verbatim to the argv (between the flags and
 	// the prompt). Reserved for advanced/experimental tests; production
 	// callers leave it nil.
@@ -210,6 +225,15 @@ func Start(ctx context.Context, opts RunOptions) (*Run, error) {
 	if opts.Thinking != "" {
 		args = append(args, "--thinking", opts.Thinking)
 	}
+	for _, ext := range opts.Extensions {
+		if ext == "" {
+			continue
+		}
+		args = append(args, "--extension", ext)
+	}
+	if opts.AppendSystemPrompt != "" {
+		args = append(args, "--append-system-prompt", opts.AppendSystemPrompt)
+	}
 	if len(opts.ExtraArgs) > 0 {
 		args = append(args, opts.ExtraArgs...)
 	}
@@ -226,6 +250,9 @@ func Start(ctx context.Context, opts RunOptions) (*Run, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = opts.Cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if len(opts.ExtraEnv) > 0 {
+		cmd.Env = append(os.Environ(), opts.ExtraEnv...)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -26,7 +26,8 @@ make install-models     # download whisper + TTS models (~230MB)
 | `cmd/trd/main.go` | CLI entry, subcommand dispatch, persisted settings |
 | `internal/dispatcher/dispatcher.go` | **The hub** — Telegram poll, command handlers, per-instance FIFO run queue |
 | `internal/agent/agent.go` | Wraps `omp -p --mode json`, parses NDJSON, exposes classified events |
-| `internal/api/api.go` | HTTP control plane for the CLI — `/api/instances`, `/api/allowed/*`, `/api/instances/{id}/cancel`, `/healthz` |
+| `internal/api/api.go` | HTTP control plane for the CLI — `/api/instances`, `/api/allowed/*`, `/api/instances/{id}/cancel`, `/api/tg/react`, `/healthz` |
+| `internal/agent/extension/` | Embedded omp TS extension (`tg_react` tool) + system-prompt snippet, written to `~/.trd/ext/tg.ts` on startup |
 | `internal/media/media.go` | Whisper STT + VITS TTS via sherpa-onnx (CGo), OpenAI API fallback |
 | `internal/audio/audio.go` | OGG/Opus decode/encode (replaces ffmpeg) |
 | `internal/storage/storage.go` | bbolt: instances (with `SessionID`), allowlist, settings |
@@ -71,6 +72,8 @@ See `porting/PLAN.md` Appendix A for the source NDJSON shapes.
 - **`.trd/` is auto-gitignored** in cloned repos.
 - **CGo required** for sherpa-onnx (whisper + TTS) and libopus (audio codec).
 - **Env vars are persisted** to bbolt settings bucket on first start. Future restarts read from DB.
+- **omp gets a TS extension per spawn.** `internal/agent/extension/tg.ts` is embedded into the binary and written to `~/.trd/ext/tg.ts` on dispatcher start. Each `omp -p` run is invoked with `--extension <path>` + `--append-system-prompt <snippet>` and per-spawn env (`TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`). The extension auto-fires 👍 on `agent_start` (deterministic, zero-token) and also registers a `tg_react(emoji)` tool so the agent can upgrade the reaction later.
+- **Graceful shutdown.** On SIGINT/SIGTERM the dispatcher calls `Shutdown(5s)`: SIGINTs each in-flight omp child's pgid in parallel, waits for them to drain (SIGKILL on timeout), then waits for the `driveAgentRun` goroutines so the final Telegram reply lands before the process exits. Pending queued prompts are dropped.
 
 ## Debugging
 
