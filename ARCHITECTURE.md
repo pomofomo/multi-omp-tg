@@ -160,10 +160,11 @@ The dispatcher embeds a tiny TypeScript file (`internal/agent/extension/tg.ts`) 
 
 - `--extension ~/.trd/ext/tg.ts` — loads the file via omp's jiti-based extension loader.
 - `--append-system-prompt <snippet>` — the ACKNOWLEDGE / REPLY WHEN DONE / ASK QUESTIONS interaction pattern (verbatim from the pre-port `channel/index.ts`) plus the two-mark visibility convention.
-- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`, `TRD_INSTANCE_ID`.
+- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_THREAD_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`, `TRD_INSTANCE_ID`, `TRD_TTS_AVAILABLE`.
 
-The extension registers two tools:
+The extension registers three tools:
 - `tg_react(emoji)` — POSTs `{chat_id, message_id, emoji}` to `/api/tg/react`; the dispatcher calls Telegram's `setMessageReaction`. The bot token never leaves the dispatcher process.
+- `tg_voice(text)` — POSTs to `/api/tg/voice`. The dispatcher synthesises the text via `media.Engine` (sherpa-onnx TTS or OpenAI fallback) and uploads the resulting OGG/Opus as a Telegram voice memo threaded to the originating message. Returns an error to the agent when TTS isn't configured (gated by `TRD_TTS_AVAILABLE` env at spawn time).
 - `trd_restart()` — POSTs to `/api/restart` with `X-Trd-Instance: <id>` from env. Returns 403 if the calling instance isn't flagged as the controller.
 
 ### Two-mark visibility chain
@@ -190,6 +191,7 @@ The control plane has only what the CLI needs:
 | `/api/allowed/{user}` | DELETE | Remove from allowlist |
 | `/api/instances/{id}/cancel` | POST | Interrupt in-flight run |
 | `/api/tg/react` | POST | Add an emoji reaction to a Telegram message (used by the omp `tg_react` tool) |
+| `/api/tg/voice` | POST | Synthesise text via TTS and upload as a Telegram voice memo (used by the omp `tg_voice` tool) |
 | `/api/instances/{id}/promote` | POST/DELETE | Set / clear the `Controller` flag (single-controller enforced) |
 | `/api/restart` | POST | Graceful in-place restart. Requires `X-Trd-Instance` header matching a controller instance; 403 otherwise. See DEBUG.md §"Self-restart (implemented)". |
 

@@ -26,6 +26,8 @@ type fakeHandler struct {
 	reactErr     error
 	restartCalls []string
 	restartErr   error
+	voiceCalls   []voiceEvent
+	voiceErr     error
 }
 
 func (h *fakeHandler) ListInstances() ([]byte, error) {
@@ -117,6 +119,23 @@ func (h *fakeHandler) DemoteController(q string) (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return q, nil
+}
+
+type voiceEvent struct {
+	chatID   int64
+	threadID int
+	replyTo  int
+	text     string
+}
+
+func (h *fakeHandler) SendVoiceMemo(chatID int64, threadID, replyTo int, text string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.voiceErr != nil {
+		return h.voiceErr
+	}
+	h.voiceCalls = append(h.voiceCalls, voiceEvent{chatID, threadID, replyTo, text})
+	return nil
 }
 
 // startTestServer spins up the api.Server on a random free port and
@@ -447,5 +466,99 @@ func TestRestartEndpointPropagatesError(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status: want 500, got %d", resp.StatusCode)
+	}
+}
+
+func TestVoiceEndpointAccepted(t *testing.T) {
+	h := &fakeHandler{}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	body := strings.NewReader(`{"chat_id":-1001,"thread_id":42,"reply_to_message_id":99,"text":"hello world"}`)
+	resp, err := http.Post(base+"/api/tg/voice", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status: want 204, got %d", resp.StatusCode)
+	}
+	if len(h.voiceCalls) != 1 {
+		t.Fatalf("voiceCalls: want 1, got %d", len(h.voiceCalls))
+	}
+	got := h.voiceCalls[0]
+	if got.chatID != -1001 || got.threadID != 42 || got.replyTo != 99 || got.text != "hello world" {
+		t.Errorf("voice call payload: %+v", got)
+	}
+}
+
+func TestVoiceEndpointValidatesBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"missing chat_id", `{"text":"hi"}`},
+		{"missing text", `{"chat_id":1}`},
+		{"empty text", `{"chat_id":1,"text":""}`},
+		{"garbage", `not json`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &fakeHandler{}
+			base, stop := startTestServer(t, h)
+			defer stop()
+
+			resp, err := http.Post(base+"/api/tg/voice", "application/json", strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status: want 400, got %d", resp.StatusCode)
+			}
+			if len(h.voiceCalls) != 0 {
+				t.Errorf("handler should not be called: %+v", h.voiceCalls)
+			}
+		})
+	}
+}
+
+func TestVoiceEndpointPropagatesError(t *testing.T) {
+	h := &fakeHandler{voiceErr: errors.New("TTS down")}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	body := strings.NewReader(`{"chat_id":1,"text":"hello"}`)
+	resp, err := http.Post(base+"/api/tg/voice", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status: want 500, got %d", resp.StatusCode)
+	}
+}
+
+func TestVoiceEndpointThreadAndReplyOptional(t *testing.T) {
+	h := &fakeHandler{}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	// No thread, no reply — defaults to General and unthreaded.
+	body := strings.NewReader(`{"chat_id":777,"text":"bare"}`)
+	resp, err := http.Post(base+"/api/tg/voice", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if len(h.voiceCalls) != 1 {
+		t.Fatalf("voiceCalls: %d", len(h.voiceCalls))
+	}
+	got := h.voiceCalls[0]
+	if got.threadID != 0 || got.replyTo != 0 {
+		t.Errorf("defaults wrong: thread=%d reply=%d", got.threadID, got.replyTo)
 	}
 }

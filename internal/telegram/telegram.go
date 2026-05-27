@@ -237,7 +237,8 @@ func (c *Client) SetReaction(ctx context.Context, chatID int64, messageID int, e
 
 // sendFile is a shared helper for sendDocument/sendPhoto/sendVoice/sendAudio.
 // fieldName is the multipart field ("document", "photo", "voice", "audio").
-func (c *Client) sendFile(ctx context.Context, method, fieldName string, chatID int64, threadID int, path, caption string) (Message, error) {
+// replyToMsgID=0 omits the reply binding.
+func (c *Client) sendFile(ctx context.Context, method, fieldName string, chatID int64, threadID, replyToMsgID int, path, caption string) (Message, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Message{}, err
@@ -249,6 +250,9 @@ func (c *Client) sendFile(ctx context.Context, method, fieldName string, chatID 
 	_ = mw.WriteField("chat_id", strconv.FormatInt(chatID, 10))
 	if threadID != 0 {
 		_ = mw.WriteField("message_thread_id", strconv.Itoa(threadID))
+	}
+	if replyToMsgID != 0 {
+		_ = mw.WriteField("reply_to_message_id", strconv.Itoa(replyToMsgID))
 	}
 	if caption != "" {
 		_ = mw.WriteField("caption", caption)
@@ -290,22 +294,23 @@ func (c *Client) sendFile(ctx context.Context, method, fieldName string, chatID 
 
 // SendDocument uploads a file and sends it as a document.
 func (c *Client) SendDocument(ctx context.Context, chatID int64, threadID int, path string, caption string) (Message, error) {
-	return c.sendFile(ctx, "sendDocument", "document", chatID, threadID, path, caption)
+	return c.sendFile(ctx, "sendDocument", "document", chatID, threadID, 0, path, caption)
 }
 
 // SendPhoto uploads and sends a photo (inline display in Telegram).
 func (c *Client) SendPhoto(ctx context.Context, chatID int64, threadID int, path string, caption string) (Message, error) {
-	return c.sendFile(ctx, "sendPhoto", "photo", chatID, threadID, path, caption)
+	return c.sendFile(ctx, "sendPhoto", "photo", chatID, threadID, 0, path, caption)
 }
 
 // SendVoice uploads and sends a voice message (OGG/Opus, inline playback).
-func (c *Client) SendVoice(ctx context.Context, chatID int64, threadID int, path string, caption string) (Message, error) {
-	return c.sendFile(ctx, "sendVoice", "voice", chatID, threadID, path, caption)
+// replyToMsgID=0 leaves the message unthreaded inside the topic.
+func (c *Client) SendVoice(ctx context.Context, chatID int64, threadID, replyToMsgID int, path string, caption string) (Message, error) {
+	return c.sendFile(ctx, "sendVoice", "voice", chatID, threadID, replyToMsgID, path, caption)
 }
 
 // SendAudio uploads and sends an audio file (MP3, etc., with player UI).
 func (c *Client) SendAudio(ctx context.Context, chatID int64, threadID int, path string, caption string) (Message, error) {
-	return c.sendFile(ctx, "sendAudio", "audio", chatID, threadID, path, caption)
+	return c.sendFile(ctx, "sendAudio", "audio", chatID, threadID, 0, path, caption)
 }
 
 // fileInfo is what getFile returns.

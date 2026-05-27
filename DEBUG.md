@@ -183,6 +183,15 @@ section is the operational cheat-sheet for what's wired today;
 | Authorise a topic to issue restarts | `trd promote <repo-name>` on the host. Exactly one controller at a time; `trd demote` clears the flag. |
 | Survive crash / OOM / host reboot | `make install-systemd` (one-time). `Restart=always` brings the dispatcher back in ~2s. |
 
+### systemd `--user` environment caveat
+
+systemd `--user` starts services with an almost-empty environment (no `$PATH`, no nvm shims). `scripts/install-systemd.sh` therefore writes a drop-in at `~/.config/systemd/user/trd.service.d/env.conf` that:
+
+- Sets `Environment=PATH=…` from the **installing shell's** `$PATH` (so `omp` can still find `node`, `git`, etc.).
+- Sets `Environment=TRD_OMP_BIN=…` to the absolute path of `omp` resolved via `command -v omp` at install time.
+
+Without this drop-in, agent spawns fail with `exec: "omp": executable file not found in $PATH` even though `omp` is on your interactive PATH. **Re-run `make install-systemd` after switching node versions (nvm) or moving `omp`**, otherwise the pin goes stale.
+
 The two paths compose: in-place exec keeps `MainPID` stable so systemd
 stays satisfied; if exec itself fails (post-`Close()`, pre-`Exec()`) the
 supervisor still respawns us.

@@ -130,11 +130,26 @@ Empty allowlist = everyone allowed.
 ## Day-to-day
 
 ```bash
-tmux attach -t trd      # see dispatcher logs (Ctrl+B, D to detach)
+tmux attach -t trd      # see dispatcher logs (Ctrl+B, D to detach; tmux path only)
 make restart            # rebuild + restart after code changes
 trd status              # check all instances
 trd watch <name>        # tail an instance's agent log
 ```
+
+### Running under systemd (recommended for headless hosts)
+
+By default `make setup` runs the dispatcher inside an operator tmux session. For unattended hosts, install a `systemd --user` unit instead:
+
+```bash
+make install-systemd    # one-time: writes ~/.config/systemd/user/trd.service
+sudo loginctl enable-linger "$USER"   # optional but required on headless hosts
+```
+
+After that, `make restart` switches automatically to `systemctl --user restart trd`, and crashes / OOMs / host reboots respawn the dispatcher in ~2s. Live logs: `journalctl --user -u trd -f`.
+
+`install-systemd` also writes a drop-in at `~/.config/systemd/user/trd.service.d/env.conf` that captures your **current shell's `$PATH`** and pins **`TRD_OMP_BIN`** to the absolute path of `omp` as resolved at install time. systemd `--user` boots with an almost-empty environment, so without this drop-in `omp` (typically installed via nvm) is not found and agent spawns fail with `exec: "omp": executable file not found in $PATH`.
+
+**Re-run `make install-systemd` whenever you change node versions (nvm) or move `omp`**, otherwise the pinned path goes stale.
 
 Conversation history survives dispatcher restarts: it lives in `~/.omp/agent/sessions/<cwd-mangled>/<session>.jsonl`, and bbolt remembers the session id. If a run is killed mid-stream the session file may stay in `.tmp` form and become unresumable — in that case `/reset` and continue.
 

@@ -163,6 +163,18 @@ func newTestDispatcher(t *testing.T, r *fakeRunner) (*Dispatcher, *recordingTele
 		runs:         map[string]*agentRun{},
 		pendingQueue: map[string][]queuedPrompt{},
 	}
+	// Voice tool seams. Default to "TTS unavailable, never called" so
+	// tests that don't exercise tg_voice behave like a host without TTS.
+	// Tests that need to verify voice routing override these directly.
+	d.canSynthesize = func() bool { return false }
+	d.sendVoice = func(_ context.Context, _ int64, _, _ int, _ string, _ string) (telegram.Message, error) {
+		t.Fatalf("sendVoice called unexpectedly")
+		return telegram.Message{}, nil
+	}
+	d.synthesize = func(_ context.Context, _, _ string) (string, error) {
+		t.Fatalf("synthesize called unexpectedly")
+		return "", nil
+	}
 	return d, rec
 }
 

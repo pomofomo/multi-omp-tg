@@ -107,6 +107,20 @@ type Dispatcher struct {
 	sendMessage func(ctx context.Context, p telegram.SendMessageParams) (telegram.Message, error)
 	setReaction func(ctx context.Context, chatID int64, msgID int, emoji string) error
 
+	// sendVoice uploads an OGG/Opus file as a Telegram voice note.
+	// Defaults to d.tg.SendVoice; tests substitute a fake that records
+	// the upload without hitting the wire.
+	sendVoice func(ctx context.Context, chatID int64, threadID, replyTo int, path string, caption string) (telegram.Message, error)
+
+	// synthesize converts text → OGG path. Defaults to
+	// d.media.Synthesize; tests substitute a fake that returns a pre-made
+	// path so they don't depend on a loaded TTS model.
+	synthesize func(ctx context.Context, text, outDir string) (string, error)
+
+	// canSynthesize reports whether TTS is available. Defaults to
+	// d.media.CanSynthesize; the seam lets tests force the gate.
+	canSynthesize func() bool
+
 	// extPath is the absolute path of the embedded omp extension that
 	// registers TRD's Telegram-aware tools (tg_react). Populated by New
 	// via extension.Ensure; empty disables the extension.
@@ -228,6 +242,9 @@ func New(opts Options) (*Dispatcher, error) {
 	}
 	d.sendMessage = d.tg.SendMessage
 	d.setReaction = d.tg.SetReaction
+	d.sendVoice = d.tg.SendVoice
+	d.synthesize = d.media.Synthesize
+	d.canSynthesize = d.media.CanSynthesize
 	if root, err := config.Root(); err == nil {
 		extPath, err := extension.Ensure(root)
 		if err != nil {
@@ -483,6 +500,54 @@ func (d *Dispatcher) ReactToMessage(chatID int64, messageID int, emoji string) e
 		return err
 	}
 	d.logger.Debug("react via api", "chat", chatID, "msg_id", messageID, "emoji", emoji)
+	return nil
+}
+
+// SendVoiceMemo implements api.Handler. It synthesises text into an
+// OGG/Opus file via the media engine, uploads it to Telegram via
+// sendVoice, and removes the temp file. Invoked from POST /api/tg/voice
+// when the omp `tg_voice` tool fires.
+//
+// Synchronous from the agent's perspective: TTS + upload typically take
+// a few seconds, so we cap at 90 s — enough headroom for cold-start
+// sherpa or a slow OpenAI round-trip, short enough that a wedged
+// network call can't stall the turn indefinitely.
+//
+// replyToMsgID=0 omits the reply binding (voice memo lands at the
+// bottom of the topic). text is the literal string to speak.
+func (d *Dispatcher) SendVoiceMemo(chatID int64, threadID, replyToMsgID int, text string) error {
+	text = strings.TrimSpace(text)
+	if chatID == 0 || text == "" {
+		return errors.New("voice: chat_id and text are required")
+	}
+	if !d.canSynthesize() {
+		return errors.New("voice: TTS is not configured (set TRD_TTS_MODEL_DIR or TRD_OPENAI_API_KEY)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	oggPath, err := d.synthesize(ctx, text, d.opts.AttachDir)
+	if err != nil {
+		d.logger.Warn("voice synthesize failed",
+			"chat", chatID, "thread", threadID, "len", len(text), "err", err)
+		return fmt.Errorf("synthesize: %w", err)
+	}
+	// Best-effort cleanup. We hold the only reference (the path is
+	// stamped with UnixNano), so deletion races with nothing.
+	defer func() {
+		if err := os.Remove(oggPath); err != nil && !os.IsNotExist(err) {
+			d.logger.Debug("voice: temp ogg cleanup failed", "path", oggPath, "err", err)
+		}
+	}()
+
+	if _, err := d.sendVoice(ctx, chatID, threadID, replyToMsgID, oggPath, ""); err != nil {
+		d.logger.Warn("voice upload failed",
+			"chat", chatID, "thread", threadID, "path", oggPath, "err", err)
+		return fmt.Errorf("sendVoice: %w", err)
+	}
+	d.logger.Info("voice sent",
+		"chat", chatID, "thread", threadID, "reply_to", replyToMsgID, "len", len(text))
 	return nil
 }
 
@@ -1333,9 +1398,11 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 		sysPromptAppend = extension.SystemPromptAppend
 		extraEnv = []string{
 			fmt.Sprintf("TRD_CHAT_ID=%d", p.chatID),
+			fmt.Sprintf("TRD_THREAD_ID=%d", p.thread),
 			fmt.Sprintf("TRD_MESSAGE_ID=%d", p.msgID),
 			fmt.Sprintf("TRD_DISPATCHER_URL=http://127.0.0.1:%d", d.opts.Port),
 			fmt.Sprintf("TRD_INSTANCE_ID=%s", inst.InstanceID),
+			fmt.Sprintf("TRD_TTS_AVAILABLE=%t", d.canSynthesize()),
 		}
 	}
 

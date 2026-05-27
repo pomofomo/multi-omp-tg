@@ -10,8 +10,9 @@ make install            # build + copy to ~/.local/bin/trd
 make test               # go test ./...
 make lint               # go vet ./...
 make install-models     # download whisper + TTS models (~230MB)
-make restart            # rebuild + restart dispatcher in operator tmux
+make restart            # rebuild + restart dispatcher (systemd --user or tmux)
 make start              # start dispatcher (reads saved config from DB)
+make install-systemd    # one-time: install ~/.config/systemd/user/trd.service (recommended for headless hosts)
 ```
 
 First-time setup:
@@ -133,7 +134,7 @@ Each session file is the full conversation. `omp -p --resume <id>` replays it.
 | Symptom | Check |
 |---------|-------|
 | Message not arriving | `trd.log`: look for "tg recv" → "tg->agent forward". |
-| Agent spawn failing | `trd.log`: "agent.Start failed". Verify `omp` is on `$PATH` or set `TRD_OMP_BIN`. |
+| Agent spawn failing | `trd.log`: "agent.Start failed". Under tmux: verify `omp` is on `$PATH` or set `TRD_OMP_BIN`. Under systemd: re-run `make install-systemd` so the drop-in at `~/.config/systemd/user/trd.service.d/env.conf` re-pins PATH and `TRD_OMP_BIN` (especially after switching node/nvm versions). |
 | No reply | `trd watch <name>`: check omp stderr for crashes / API errors. |
 | Session not resuming | `/reset` to clear the session id; next message starts fresh. omp can't resume a `.tmp` session file (left behind by a killed run). |
 | TTS/Whisper broken | `trd.log`: search for "whisper:" entries. Verify models in `~/.trd/models/`. |
@@ -144,7 +145,7 @@ Each session file is the full conversation. `omp -p --resume <id>` replays it.
 |----------|---------|-----------|
 | `TELEGRAM_BOT_TOKEN` | Bot authentication | Yes |
 | `TRD_PORT` | Dispatcher HTTP API port (default 7777) | No |
-| `TRD_OMP_BIN` | omp binary path (default `omp` on PATH) | Yes |
+| `TRD_OMP_BIN` | omp binary path (default `omp` on PATH). Under systemd, auto-pinned by `make install-systemd` to the absolute path of `omp` at install time. | Yes |
 | `TRD_WHISPER_MODEL_DIR` | Whisper model directory | Yes |
 | `TRD_TTS_MODEL_DIR` | TTS model directory | Yes |
 | `TRD_OPENAI_API_KEY` | OpenAI API fallback for STT/TTS | Yes |

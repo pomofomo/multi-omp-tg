@@ -42,6 +42,12 @@ type Handler interface {
 	// by the in-process omp extension (see internal/agent/extension) so
 	// the agent can 👍 a freshly-received user message.
 	ReactToMessage(chatID int64, messageID int, emoji string) error
+	// SendVoiceMemo synthesises text to OGG/Opus and uploads it as a
+	// Telegram voice note. Used by the omp `tg_voice` tool. Returns an
+	// error when TTS is unavailable, synthesis fails, or the upload
+	// fails. replyToMsgID=0 leaves the voice note unthreaded inside
+	// the topic.
+	SendVoiceMemo(chatID int64, threadID, replyToMsgID int, text string) error
 	// RequestRestart marks the dispatcher as pending a graceful restart.
 	// The dispatcher MUST drain in-flight runs and persist deferred
 	// prompts before re-executing itself. callerInstanceID is the
@@ -86,6 +92,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("POST /api/tg/react", s.handleAPIReact)
 	mux.HandleFunc("POST /api/restart", s.handleAPIRestart)
 	mux.HandleFunc("POST /api/instances/{id}/promote", s.handleAPIPromote)
+	mux.HandleFunc("POST /api/tg/voice", s.handleAPIVoice)
 	mux.HandleFunc("DELETE /api/instances/{id}/promote", s.handleAPIDemote)
 
 	s.srv = &http.Server{
@@ -271,4 +278,36 @@ func (s *Server) handleAPIDemote(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"instance_id":"` + resolved + `"}`))
+}
+
+// handleAPIVoice accepts a TTS-then-send-voice-memo request from the
+// in-process omp extension. The dispatcher synthesises the text and
+// uploads the resulting OGG/Opus to the requested chat/topic.
+//
+//	body: {"chat_id":int, "thread_id":int, "reply_to_message_id":int, "text":string}
+//
+// chat_id and text are required; thread_id=0 sends to General;
+// reply_to_message_id=0 omits the reply binding. Maps SendVoiceMemo
+// errors to HTTP 500 (TTS not configured, sherpa failure, Telegram
+// upload failure all surface here so the agent can react).
+func (s *Server) handleAPIVoice(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ChatID    int64  `json:"chat_id"`
+		ThreadID  int    `json:"thread_id"`
+		ReplyTo   int    `json:"reply_to_message_id"`
+		Text      string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.ChatID == 0 || body.Text == "" {
+		http.Error(w, "chat_id and text are required", http.StatusBadRequest)
+		return
+	}
+	if err := s.h.SendVoiceMemo(body.ChatID, body.ThreadID, body.ReplyTo, body.Text); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
