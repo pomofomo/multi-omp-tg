@@ -22,8 +22,10 @@ type fakeHandler struct {
 	rmErr     error
 	cancelled []string
 	cancelErr error
-	reactions []reactEvent
-	reactErr  error
+	reactions    []reactEvent
+	reactErr     error
+	restartCalls []string
+	restartErr   error
 }
 
 func (h *fakeHandler) ListInstances() ([]byte, error) {
@@ -93,6 +95,28 @@ func (h *fakeHandler) ReactToMessage(chatID int64, messageID int, emoji string) 
 	}
 	h.reactions = append(h.reactions, reactEvent{chatID: chatID, messageID: messageID, emoji: emoji})
 	return nil
+}
+
+func (h *fakeHandler) RequestRestart(callerInstanceID string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restartErr != nil {
+		return h.restartErr
+	}
+	h.restartCalls = append(h.restartCalls, callerInstanceID)
+	return nil
+}
+
+func (h *fakeHandler) PromoteController(q string) (string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return q, nil
+}
+
+func (h *fakeHandler) DemoteController(q string) (string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return q, nil
 }
 
 // startTestServer spins up the api.Server on a random free port and
@@ -351,5 +375,77 @@ func TestReactEndpointPropagatesError(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status: %d", resp.StatusCode)
+	}
+}
+
+func TestRestartEndpointAccepted(t *testing.T) {
+	h := &fakeHandler{}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/restart", nil)
+	req.Header.Set("X-Trd-Instance", "ctrl-inst-id")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: want 202, got %d", resp.StatusCode)
+	}
+	if len(h.restartCalls) != 1 || h.restartCalls[0] != "ctrl-inst-id" {
+		t.Errorf("RequestRestart calls: %v", h.restartCalls)
+	}
+}
+
+func TestRestartEndpointRejectsMissingHeader(t *testing.T) {
+	h := &fakeHandler{}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	resp, err := http.Post(base+"/api/restart", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: want 400, got %d", resp.StatusCode)
+	}
+	if len(h.restartCalls) != 0 {
+		t.Errorf("handler was called: %v", h.restartCalls)
+	}
+}
+
+func TestRestartEndpointUnauthorizedMapsTo403(t *testing.T) {
+	h := &fakeHandler{restartErr: ErrUnauthorized}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/restart", nil)
+	req.Header.Set("X-Trd-Instance", "not-the-controller")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: want 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestRestartEndpointPropagatesError(t *testing.T) {
+	h := &fakeHandler{restartErr: errors.New("storage failure")}
+	base, stop := startTestServer(t, h)
+	defer stop()
+
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/restart", nil)
+	req.Header.Set("X-Trd-Instance", "ctrl")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status: want 500, got %d", resp.StatusCode)
 	}
 }

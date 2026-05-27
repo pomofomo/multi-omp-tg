@@ -36,6 +36,9 @@ Usage:
   trd cd      <name-or-prefix>    print the instance's repo path
   trd allow   <username>          add a Telegram username to the allowlist
   trd deny    <username>          remove a Telegram username from the allowlist
+  trd promote <name-or-prefix>    flag this instance as the controller
+                                  (authorises /restart-self & /api/restart)
+  trd demote  <name-or-prefix>    clear the controller flag
   trd allowed                     print the allowlist
 
 <name-or-prefix> matches against repo name first, then instance ID prefix.
@@ -76,6 +79,10 @@ func main() {
 		cmdDeny(args)
 	case "allowed":
 		cmdAllowed(args)
+	case "promote":
+		cmdPromote(args)
+	case "demote":
+		cmdDemote(args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -159,6 +166,33 @@ func cmdStart(args []string) {
 	// tears down the pipes underneath them — otherwise the children
 	// would EPIPE on their next stdout write.
 	d.Shutdown(5 * time.Second)
+
+	// Graceful in-place self-restart: Run returned because the
+	// dispatcher's drain completed (all in-flight omp runs finished and
+	// their Telegram replies landed). Persist the long-poll cursor,
+	// release the DB, then replace this process image so the supervisor
+	// (tmux, systemd) doesn't observe a crash. See DEBUG.md
+	// "Proposal A — graceful in-process self-restart".
+	if runErr == nil && d.PendingRestart() {
+		if err := d.FlushBeforeExec(); err != nil {
+			logger.Warn("flush before exec failed", "err", err)
+		}
+		if err := d.Close(); err != nil {
+			logger.Warn("close before exec failed", "err", err)
+		}
+		execPath, err := os.Executable()
+		if err != nil {
+			logger.Error("self-exec: resolve executable", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("self-exec: replacing process", "path", execPath, "argv", os.Args)
+		if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
+			logger.Error("self-exec failed", "err", err)
+			os.Exit(1)
+		}
+		// Unreachable: Exec replaces the process image on success.
+	}
+
 	if runErr != nil {
 		logger.Error("run", "err", runErr)
 		os.Exit(1)
@@ -234,9 +268,13 @@ func cmdStatus(args []string) {
 		} else if len(session) > 8 {
 			session = session[:8]
 		}
-		fmt.Printf("%-20s %s  %s  state=%-8s session=%s  running=%v  %s\n",
+		flags := ""
+		if inst.Controller {
+			flags = " [controller]"
+		}
+		fmt.Printf("%-20s %s  %s  state=%-8s session=%s  running=%v%s  %s\n",
 			name, inst.InstanceID[:8], shortTime(inst.CreatedAt),
-			inst.State, session, inst.Running, inst.RepoURL)
+			inst.State, session, inst.Running, flags, inst.RepoURL)
 	}
 }
 
@@ -399,6 +437,73 @@ func cmdAllowed(args []string) {
 	for _, u := range users {
 		fmt.Printf("  @%s\n", u)
 	}
+}
+
+func cmdPromote(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: trd promote <name-or-prefix>")
+		os.Exit(2)
+	}
+	inst, resolved, err := controllerCall(http.MethodPost, args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	repo := inst.RepoName
+	if repo == "" {
+		repo = storage.RepoNameFromURL(inst.RepoURL)
+	}
+	fmt.Printf("promoted %s (%s) — /restart-self and /api/restart are now authorised in this instance\n",
+		repo, resolved[:8])
+}
+
+func cmdDemote(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: trd demote <name-or-prefix>")
+		os.Exit(2)
+	}
+	inst, resolved, err := controllerCall(http.MethodDelete, args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	repo := inst.RepoName
+	if repo == "" {
+		repo = storage.RepoNameFromURL(inst.RepoURL)
+	}
+	fmt.Printf("demoted %s (%s) — controller flag cleared\n", repo, resolved[:8])
+}
+
+// controllerCall hits POST/DELETE /api/instances/{id}/promote on the
+// running dispatcher. Returns the resolved instance (from the local
+// instance list) plus the canonical id echoed in the JSON response, so
+// callers can confirm which row was actually touched when the query was
+// a prefix.
+func controllerCall(method, query string) (*instanceInfo, string, error) {
+	inst, err := findInstance(query)
+	if err != nil {
+		return nil, "", err
+	}
+	port := envInt("TRD_PORT", 7777)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/instances/%s/promote", port, inst.InstanceID)
+	req, _ := http.NewRequest(method, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("dispatcher API not reachable (is `trd start` running?): %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("controller call failed: %s\n%s", resp.Status, string(body))
+	}
+	var result struct {
+		InstanceID string `json:"instance_id"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&result)
+	if result.InstanceID == "" {
+		result.InstanceID = inst.InstanceID
+	}
+	return inst, result.InstanceID, nil
 }
 
 func findInstance(query string) (*instanceInfo, error) {

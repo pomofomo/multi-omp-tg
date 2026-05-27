@@ -125,15 +125,21 @@ The dispatcher does sweep stale attachments older than 7 days as part of `ListIn
 
 ## Storage
 
-bbolt with five buckets:
+bbolt buckets:
 
 | Bucket | Key | Value | Purpose |
 |--------|-----|-------|---------|
-| `instances` | instance_id | JSON Instance (incl. SessionID) | Primary store |
+| `instances` | instance_id | JSON Instance (incl. SessionID, Controller) | Primary store |
 | `by_topic` | chat_id:thread_id | instance_id | Topic lookup |
 | `by_secret` | secret | instance_id | Legacy (kept for old rows) |
 | `allowed_users` | username | "1" | User allowlist |
-| `settings` | env var name | value | Persistent config |
+| `settings` | env var name / `last_update_id` | value | Persistent config + Telegram long-poll cursor |
+| `deferred_prompts` | nanos:seq | JSON DeferredPrompt | Prompts captured during a restart drain; redelivered on the next startup |
+
+The `settings` bucket also stores the Telegram long-poll cursor as
+`last_update_id` (decimal int64). Together with `deferred_prompts`,
+this is what makes the in-place self-restart lossless — see DEBUG.md
+§"Self-restart (implemented)".
 
 `Put` transactionally cleans stale index entries when a row changes.
 
@@ -154,9 +160,11 @@ The dispatcher embeds a tiny TypeScript file (`internal/agent/extension/tg.ts`) 
 
 - `--extension ~/.trd/ext/tg.ts` — loads the file via omp's jiti-based extension loader.
 - `--append-system-prompt <snippet>` — the ACKNOWLEDGE / REPLY WHEN DONE / ASK QUESTIONS interaction pattern (verbatim from the pre-port `channel/index.ts`) plus the two-mark visibility convention.
-- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`.
+- Per-spawn env vars: `TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`, `TRD_INSTANCE_ID`.
 
-The extension registers a single `tg_react(emoji)` tool. The bot token never leaves the dispatcher process; the tool POSTs `{chat_id, message_id, emoji}` to `/api/tg/react`, which then calls Telegram's `setMessageReaction`.
+The extension registers two tools:
+- `tg_react(emoji)` — POSTs `{chat_id, message_id, emoji}` to `/api/tg/react`; the dispatcher calls Telegram's `setMessageReaction`. The bot token never leaves the dispatcher process.
+- `trd_restart()` — POSTs to `/api/restart` with `X-Trd-Instance: <id>` from env. Returns 403 if the calling instance isn't flagged as the controller.
 
 ### Two-mark visibility chain
 
@@ -182,6 +190,8 @@ The control plane has only what the CLI needs:
 | `/api/allowed/{user}` | DELETE | Remove from allowlist |
 | `/api/instances/{id}/cancel` | POST | Interrupt in-flight run |
 | `/api/tg/react` | POST | Add an emoji reaction to a Telegram message (used by the omp `tg_react` tool) |
+| `/api/instances/{id}/promote` | POST/DELETE | Set / clear the `Controller` flag (single-controller enforced) |
+| `/api/restart` | POST | Graceful in-place restart. Requires `X-Trd-Instance` header matching a controller instance; 403 otherwise. See DEBUG.md §"Self-restart (implemented)". |
 
 No WebSocket. No auth (binds to `127.0.0.1` only).
 

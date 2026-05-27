@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -120,6 +121,23 @@ type Dispatcher struct {
 	// runWG tracks in-flight driveAgentRun goroutines so Shutdown can
 	// wait for them to drain cleanly before the process exits.
 	runWG sync.WaitGroup
+
+	// Restart machinery. See § "Restart" in dispatcher.go's package
+	// comment and DEBUG.md "Proposal A — graceful in-process self-restart".
+	//
+	// pendingRestart is set when a controller calls RequestRestart;
+	// enqueueOrRun consults it and persists incoming prompts to bbolt
+	// instead of spawning new omp runs. finishRun checks it after every
+	// run completes and, when len(runs)==0, calls stopForRestart to
+	// unwind Run() so cmdStart can syscall.Exec us in place.
+	//
+	// lastUpdateID mirrors the Telegram long-poll cursor maintained by
+	// pollLoop so the value can be persisted across the re-exec gap.
+	// restartOnce guards the single triggerRestartStop call.
+	pendingRestart atomic.Bool
+	lastUpdateID   atomic.Int64
+	restartOnce    sync.Once
+	stopForRestart context.CancelFunc
 }
 
 // agentRun is the live handle for an `omp -p` invocation. Created by
@@ -283,6 +301,153 @@ func (d *Dispatcher) Shutdown(grace time.Duration) {
 	}
 }
 
+// --- Graceful self-restart ---
+
+// RequestRestart marks the dispatcher as pending a graceful restart and
+// kicks the drain-and-stop sequence. callerInstanceID is the claimed
+// identity from the X-Trd-Instance header (api.handleAPIRestart) — it
+// must match a stored instance flagged as the controller.
+//
+// Idempotent: a second call while a restart is already pending is a
+// no-op (but still validates the caller).
+//
+// Implements api.Handler.
+func (d *Dispatcher) RequestRestart(callerInstanceID string) error {
+	if !d.isControllerInstance(callerInstanceID) {
+		d.logger.Warn("restart: unauthorized caller",
+			"caller", shortID(callerInstanceID))
+		return api.ErrUnauthorized
+	}
+	if d.pendingRestart.Swap(true) {
+		// Already pending — surface success so the caller (curl, agent
+		// tool, Telegram command) gets a consistent response.
+		return nil
+	}
+
+	d.runMu.Lock()
+	// Flush every in-memory queued prompt to bbolt so the successor
+	// process picks them up after the re-exec. This must happen here
+	// (and not in finishRun) so prompts that arrived BEFORE the restart
+	// request — already sitting in pendingQueue — are not dropped.
+	flushed := 0
+	for instID, q := range d.pendingQueue {
+		for _, p := range q {
+			if err := d.store.EnqueueDeferred(storage.DeferredPrompt{
+				InstanceID: instID,
+				ChatID:     p.chatID,
+				ThreadID:   p.thread,
+				MsgID:      p.msgID,
+				User:       p.user,
+				Text:       p.text,
+			}); err != nil {
+				d.logger.Warn("restart: defer queued prompt failed",
+					"instance", shortID(instID), "msg_id", p.msgID, "err", err)
+				continue
+			}
+			flushed++
+		}
+		delete(d.pendingQueue, instID)
+	}
+	active := len(d.runs)
+	d.runMu.Unlock()
+
+	d.logger.Info("restart: requested",
+		"caller", shortID(callerInstanceID),
+		"deferred_queued", flushed,
+		"active_runs", active)
+	if active == 0 {
+		d.triggerRestartStop()
+	}
+	return nil
+}
+
+// PendingRestart reports whether a graceful restart has been requested
+// and the dispatcher has begun draining. cmdStart consults this after
+// Run returns to decide between syscall.Exec and a normal shutdown.
+func (d *Dispatcher) PendingRestart() bool { return d.pendingRestart.Load() }
+
+// FlushBeforeExec persists any state that must survive an in-place
+// re-exec. Currently only the long-poll cursor — Instance rows are
+// already written eagerly on every transition. Safe to call multiple
+// times.
+func (d *Dispatcher) FlushBeforeExec() error {
+	if v := d.lastUpdateID.Load(); v > 0 {
+		if err := d.store.SetLastUpdateID(int(v)); err != nil {
+			d.logger.Warn("flush_before_exec: persist last_update_id failed", "err", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// triggerRestartStop cancels the runCtx held by Run so pollLoop and the
+// API server exit, allowing cmdStart to re-exec. Guarded by restartOnce
+// because both RequestRestart (when idle) and finishRun (after the last
+// run drains) call it.
+func (d *Dispatcher) triggerRestartStop() {
+	d.restartOnce.Do(func() {
+		d.logger.Info("restart: drain complete, stopping for re-exec")
+		if d.stopForRestart != nil {
+			d.stopForRestart()
+		}
+	})
+}
+
+// isControllerInstance returns true when id is non-empty and resolves to
+// a stored instance with Controller=true. Used to authorise restart
+// requests both from /api/restart and from the /restart-self command.
+func (d *Dispatcher) isControllerInstance(id string) bool {
+	if id == "" {
+		return false
+	}
+	inst, err := d.store.Get(id)
+	if err != nil || inst == nil {
+		return false
+	}
+	return inst.Controller
+}
+
+// redeliverDeferredPrompts drains the bbolt deferred_prompts bucket on
+// startup and re-routes each item through enqueueOrRun. Prompts whose
+// instance has vanished, been forgotten, or been /stopped between drains
+// are logged and dropped — there is no user-visible recovery path for
+// them.
+//
+// Called once at the top of Run, before pollLoop, so any prompt that
+// landed during the predecessor's restart drain is processed before new
+// Telegram updates can arrive.
+func (d *Dispatcher) redeliverDeferredPrompts(_ context.Context) {
+	items, err := d.store.DrainDeferred()
+	if err != nil {
+		d.logger.Warn("startup: drain deferred prompts failed", "err", err)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	d.logger.Info("startup: redriving deferred prompts", "count", len(items))
+	for _, item := range items {
+		inst, err := d.store.Get(item.InstanceID)
+		if err != nil || inst == nil {
+			d.logger.Warn("startup: deferred prompt for missing instance, dropping",
+				"instance", shortID(item.InstanceID), "msg_id", item.MsgID, "err", err)
+			continue
+		}
+		if inst.State != storage.StateRunning {
+			d.logger.Info("startup: deferred prompt for non-running instance, dropping",
+				"instance", shortID(item.InstanceID), "state", inst.State, "msg_id", item.MsgID)
+			continue
+		}
+		d.enqueueOrRun(*inst, queuedPrompt{
+			chatID: item.ChatID,
+			thread: item.ThreadID,
+			msgID:  item.MsgID,
+			user:   item.User,
+			text:   item.Text,
+		})
+	}
+}
+
 // --- api.Handler implementation ---
 
 // ListInstances returns all instances as JSON for the CLI API endpoint,
@@ -354,6 +519,58 @@ func (d *Dispatcher) CancelRun(query string) error {
 	return nil
 }
 
+// PromoteController flags the resolved instance as the controller and
+// clears the flag on every other row. Enforces single-controller
+// invariant so RequestRestart's authorisation check has a unique
+// answer. Returns the canonical instance id.
+func (d *Dispatcher) PromoteController(query string) (string, error) {
+	inst, err := d.findInstance(query)
+	if err != nil {
+		return "", err
+	}
+	all, err := d.store.All()
+	if err != nil {
+		return "", err
+	}
+	for _, other := range all {
+		if other.InstanceID == inst.InstanceID {
+			continue
+		}
+		if !other.Controller {
+			continue
+		}
+		other.Controller = false
+		if err := d.store.Put(other); err != nil {
+			return "", fmt.Errorf("clear controller on %s: %w", shortID(other.InstanceID), err)
+		}
+		d.logger.Info("controller: cleared previous", "instance", shortID(other.InstanceID))
+	}
+	inst.Controller = true
+	if err := d.store.Put(*inst); err != nil {
+		return "", err
+	}
+	d.logger.Info("controller: promoted", "instance", shortID(inst.InstanceID), "repo", inst.RepoName)
+	return inst.InstanceID, nil
+}
+
+// DemoteController clears the controller flag on the resolved instance.
+// No-op when the flag is already clear. Returns the canonical id.
+func (d *Dispatcher) DemoteController(query string) (string, error) {
+	inst, err := d.findInstance(query)
+	if err != nil {
+		return "", err
+	}
+	if !inst.Controller {
+		return inst.InstanceID, nil
+	}
+	inst.Controller = false
+	if err := d.store.Put(*inst); err != nil {
+		return "", err
+	}
+	d.logger.Info("controller: demoted", "instance", shortID(inst.InstanceID), "repo", inst.RepoName)
+	return inst.InstanceID, nil
+}
+
 // isUserAllowed checks a Telegram username against the combined allowlist
 // (stored users + TRD_ALLOWED_USERNAMES env var). An empty combined list
 // means everyone is allowed (backwards compatible).
@@ -400,14 +617,24 @@ func (d *Dispatcher) SaveSettings(keys []string) {
 
 // --- Telegram long-poll and command handling ---
 
-// Run starts the HTTP API and Telegram long-poll. Blocks until ctx is canceled.
+// Run starts the HTTP API and Telegram long-poll. Blocks until ctx is
+// canceled OR a graceful restart has been requested and all in-flight
+// runs have drained (see RequestRestart / stopForRestart).
 func (d *Dispatcher) Run(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	d.stopForRestart = cancel
+	defer cancel()
+
 	go func() {
-		if err := d.api.ListenAndServe(ctx); err != nil {
+		if err := d.api.ListenAndServe(runCtx); err != nil {
 			d.logger.Error("api server", "err", err)
 		}
 	}()
-	return d.pollLoop(ctx)
+
+	// Re-deliver any prompts that landed during a prior restart drain.
+	d.redeliverDeferredPrompts(runCtx)
+
+	return d.pollLoop(runCtx)
 }
 
 func (d *Dispatcher) pollLoop(ctx context.Context) error {
@@ -430,11 +657,18 @@ func (d *Dispatcher) pollLoop(ctx context.Context) error {
 		{Command: "cancel", Description: "Interrupt the in-flight agent run for this topic"},
 		{Command: "forget", Description: "Delete the topic-repo mapping"},
 		{Command: "help", Description: "Show available commands"},
+		{Command: "restart-self", Description: "(controller only) Drain in-flight runs and re-exec the dispatcher in place"},
 	}); err != nil {
 		d.logger.Warn("setMyCommands failed", "err", err)
 	}
 
-	offset := 0
+	// Seed the long-poll cursor from bbolt so we resume across an
+	// in-place re-exec without redelivering or skipping updates.
+	offset := d.store.GetLastUpdateID()
+	if offset > 0 {
+		d.logger.Info("telegram poll: resuming from persisted offset", "offset", offset)
+	}
+	d.lastUpdateID.Store(int64(offset))
 	for {
 		select {
 		case <-ctx.Done():
@@ -460,6 +694,15 @@ func (d *Dispatcher) pollLoop(ctx context.Context) error {
 			}
 			if u.EditedMessage != nil {
 				d.handleEditedMessage(ctx, u.EditedMessage)
+			}
+		}
+		// Persist the cursor when it advances so the successor of an
+		// in-place re-exec (or a crash) resumes correctly. Skip the
+		// write when the batch was empty (offset unchanged).
+		if len(updates) > 0 {
+			d.lastUpdateID.Store(int64(offset))
+			if err := d.store.SetLastUpdateID(offset); err != nil {
+				d.logger.Warn("persist last_update_id failed", "err", err)
 			}
 		}
 	}
@@ -519,6 +762,8 @@ func (d *Dispatcher) handleMessage(ctx context.Context, m *telegram.Message) {
 		d.cmdStop(ctx, m)
 	case text == "/restart":
 		d.cmdRestart(ctx, m)
+	case text == "/restart-self":
+		d.cmdRestartSelf(ctx, m)
 	case text == "/status":
 		d.cmdStatus(ctx, m)
 	case text == "/forget":
@@ -680,6 +925,35 @@ func (d *Dispatcher) cmdReset(ctx context.Context, m *telegram.Message) {
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Reset — the next message will start a fresh agent session.")
 }
 
+// cmdRestartSelf triggers a dispatcher-wide graceful restart from the
+// bound topic. The topic's instance must be flagged as the controller
+// (set via `trd promote`) — this is the same authorisation gate that
+// /api/restart enforces.
+//
+// User-visible behaviour: the in-flight run that issued this command
+// (if any) is allowed to finish naturally; queued prompts are
+// persisted; then the process re-execs in place. A "restart complete"
+// confirmation lands in a fresh run after the successor process boots.
+func (d *Dispatcher) cmdRestartSelf(ctx context.Context, m *telegram.Message) {
+	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
+	if inst == nil {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
+		return
+	}
+	if !inst.Controller {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
+			"this topic's instance is not the controller — refusing /restart-self.\n"+
+				"Run `trd promote "+inst.RepoName+"` on the host to authorise.")
+		return
+	}
+	if err := d.RequestRestart(inst.InstanceID); err != nil {
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "restart failed: "+err.Error())
+		return
+	}
+	d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
+		"Restart accepted. Draining in-flight runs, then re-execing the dispatcher in place.")
+}
+
 func (d *Dispatcher) cmdHelp(ctx context.Context, m *telegram.Message) {
 	help := `TRD — Telegram Repo Dispatcher (omp headless mode)
 
@@ -695,6 +969,7 @@ func (d *Dispatcher) cmdHelp(ctx context.Context, m *telegram.Message) {
 /debug — Toggle dispatcher debug logging
 /forget — Delete the topic-repo mapping
 /help — Show this message
+/restart-self — (controller-only) Drain in-flight runs and re-exec the dispatcher in place
 
 Anything else you type spawns omp -p in the bound repo.`
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, help)
@@ -992,6 +1267,28 @@ func (d *Dispatcher) enqueueOrRun(inst storage.Instance, p queuedPrompt) {
 	// "model started thinking".
 	go d.sendReaction(inst.ChatID, p.msgID, "👀")
 
+	// Restart drain in progress: persist the prompt to bbolt so the
+	// successor process picks it up post-exec. The 👀 above already
+	// shipped (system received it); the 👍 will land in the successor
+	// once that turn's omp boots.
+	if d.pendingRestart.Load() {
+		if err := d.store.EnqueueDeferred(storage.DeferredPrompt{
+			InstanceID: inst.InstanceID,
+			ChatID:     p.chatID,
+			ThreadID:   p.thread,
+			MsgID:      p.msgID,
+			User:       p.user,
+			Text:       p.text,
+		}); err != nil {
+			d.logger.Warn("restart: defer incoming prompt failed",
+				"instance", shortID(inst.InstanceID), "msg_id", p.msgID, "err", err)
+		} else {
+			d.logger.Info("restart: prompt deferred for successor",
+				"instance", shortID(inst.InstanceID), "msg_id", p.msgID)
+		}
+		return
+	}
+
 	d.runMu.Lock()
 	if _, busy := d.runs[inst.InstanceID]; busy {
 		d.pendingQueue[inst.InstanceID] = append(d.pendingQueue[inst.InstanceID], p)
@@ -1038,6 +1335,7 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 			fmt.Sprintf("TRD_CHAT_ID=%d", p.chatID),
 			fmt.Sprintf("TRD_MESSAGE_ID=%d", p.msgID),
 			fmt.Sprintf("TRD_DISPATCHER_URL=http://127.0.0.1:%d", d.opts.Port),
+			fmt.Sprintf("TRD_INSTANCE_ID=%s", inst.InstanceID),
 		}
 	}
 
@@ -1163,6 +1461,15 @@ func (d *Dispatcher) finishRun(instanceID string) {
 		}
 	}
 	delete(d.runs, instanceID)
+	// Restart drain: when this was the last active run and a restart is
+	// pending, cancel Run so cmdStart can re-exec. RequestRestart has
+	// already flushed pendingQueue to bbolt, so we don't redispatch from
+	// the local map below.
+	if d.pendingRestart.Load() && len(d.runs) == 0 {
+		d.runMu.Unlock()
+		d.triggerRestartStop()
+		return
+	}
 	queue := d.pendingQueue[instanceID]
 	if len(queue) == 0 {
 		d.runMu.Unlock()

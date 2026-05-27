@@ -2,9 +2,11 @@
 package storage
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,12 +14,20 @@ import (
 )
 
 var (
-	bucketInstances    = []byte("instances")
-	bucketByTopic      = []byte("by_topic")
-	bucketBySecret     = []byte("by_secret")
-	bucketAllowedUsers = []byte("allowed_users")
-	bucketSettings     = []byte("settings")
+	bucketInstances       = []byte("instances")
+	bucketByTopic         = []byte("by_topic")
+	bucketBySecret        = []byte("by_secret")
+	bucketAllowedUsers    = []byte("allowed_users")
+	bucketSettings        = []byte("settings")
+	bucketDeferredPrompts = []byte("deferred_prompts")
 )
+
+// settingLastUpdateID is the persisted Telegram long-poll cursor. Stored
+// as a decimal-encoded int64 in the settings bucket so the successor of
+// an in-place re-exec can resume polling without redelivering or losing
+// updates that landed during the exec gap. See DEBUG.md
+// "Proposal A — graceful in-process self-restart".
+const settingLastUpdateID = "last_update_id"
 
 // State is the running state of an instance.
 type State string
@@ -44,6 +54,7 @@ type Instance struct {
 	Debug       bool      `json:"debug,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	Controller  bool      `json:"controller,omitempty"`
 }
 
 // RepoNameFromURL extracts a short repo name from a git URL.
@@ -73,7 +84,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketInstances, bucketByTopic, bucketBySecret, bucketAllowedUsers, bucketSettings} {
+		for _, b := range [][]byte{bucketInstances, bucketByTopic, bucketBySecret, bucketAllowedUsers, bucketSettings, bucketDeferredPrompts} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -317,4 +328,109 @@ func (s *Store) AllSettings() (map[string]string, error) {
 		})
 	})
 	return out, err
+}
+
+// --- Long-poll cursor (for in-place self-restart) ---
+
+// GetLastUpdateID returns the last Telegram update_id we acknowledged.
+// Returns 0 when no cursor has been persisted yet (fresh DB or never
+// restarted). See DEBUG.md "State that must survive an in-place exec".
+func (s *Store) GetLastUpdateID() int {
+	v := s.GetSetting(settingLastUpdateID)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// SetLastUpdateID persists the last acked Telegram update_id so a
+// successor process can resume polling at update_id+1 without
+// redelivering or skipping updates.
+func (s *Store) SetLastUpdateID(id int) error {
+	return s.SetSetting(settingLastUpdateID, strconv.Itoa(id))
+}
+
+// --- Deferred prompts (survive an in-place self-restart) ---
+
+// DeferredPrompt is a Telegram-driven prompt that arrived while the
+// dispatcher was draining for restart. The successor process drains the
+// bucket on startup and re-routes each one through enqueueOrRun.
+type DeferredPrompt struct {
+	InstanceID string    `json:"instance_id"`
+	ChatID     int64     `json:"chat_id"`
+	ThreadID   int       `json:"thread_id"`
+	MsgID      int       `json:"msg_id"`
+	User       string    `json:"user,omitempty"`
+	Text       string    `json:"text"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+}
+
+// EnqueueDeferred appends a prompt to the deferred queue. Keys are
+// timestamp-prefixed monotonic ids so DrainDeferred returns items in
+// FIFO order across processes.
+func (s *Store) EnqueueDeferred(p DeferredPrompt) error {
+	if p.EnqueuedAt.IsZero() {
+		p.EnqueuedAt = time.Now().UTC()
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDeferredPrompts)
+		seq, err := b.NextSequence()
+		if err != nil {
+			return err
+		}
+		// Key: 8-byte big-endian nanos | 8-byte big-endian sequence.
+		// Sortable by time first (so successor drains oldest first) with
+		// the sequence as tiebreaker for sub-nanosecond inserts.
+		key := make([]byte, 16)
+		binary.BigEndian.PutUint64(key[:8], uint64(p.EnqueuedAt.UnixNano()))
+		binary.BigEndian.PutUint64(key[8:], seq)
+		return b.Put(key, data)
+	})
+}
+
+// DrainDeferred atomically reads and clears every deferred prompt,
+// returning them in FIFO order. Items are deleted within the same
+// transaction so a crash mid-drain at most loses (never duplicates) one
+// pass — the successor of the successor will not redeliver them.
+func (s *Store) DrainDeferred() ([]DeferredPrompt, error) {
+	var out []DeferredPrompt
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDeferredPrompts)
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var p DeferredPrompt
+			if err := json.Unmarshal(v, &p); err != nil {
+				// Skip malformed entry but log via the key being dropped.
+				continue
+			}
+			out = append(out, p)
+		}
+		// Delete every key we just read. Recreate the bucket to wipe in
+		// one shot — cheaper than per-key Delete on a long backlog.
+		if err := tx.DeleteBucket(bucketDeferredPrompts); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucket(bucketDeferredPrompts)
+		return err
+	})
+	return out, err
+}
+
+// DeferredCount returns the current size of the deferred queue without
+// draining it. Useful for ops endpoints.
+func (s *Store) DeferredCount() (int, error) {
+	var n int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		n = tx.Bucket(bucketDeferredPrompts).Stats().KeyN
+		return nil
+	})
+	return n, err
 }

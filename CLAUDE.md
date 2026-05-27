@@ -15,7 +15,8 @@ make build              # CGO_ENABLED=1 go build → bin/trd
 make install            # build + copy to ~/.local/bin/trd
 make test               # go test ./...
 make lint               # go vet ./...
-make restart            # rebuild + restart dispatcher in operator tmux
+make restart            # systemctl --user restart trd (when unit active), else tmux fallback
+make install-systemd    # one-time: install ~/.config/systemd/user/trd.service & enable it
 make install-models     # download whisper + TTS models (~230MB)
 ```
 
@@ -26,11 +27,11 @@ make install-models     # download whisper + TTS models (~230MB)
 | `cmd/trd/main.go` | CLI entry, subcommand dispatch, persisted settings |
 | `internal/dispatcher/dispatcher.go` | **The hub** — Telegram poll, command handlers, per-instance FIFO run queue |
 | `internal/agent/agent.go` | Wraps `omp -p --mode json`, parses NDJSON, exposes classified events |
-| `internal/api/api.go` | HTTP control plane for the CLI — `/api/instances`, `/api/allowed/*`, `/api/instances/{id}/cancel`, `/api/tg/react`, `/healthz` |
-| `internal/agent/extension/` | Embedded omp TS extension (`tg_react` tool) + system-prompt snippet, written to `~/.trd/ext/tg.ts` on startup |
+| `internal/api/api.go` | HTTP control plane — `/api/instances`, `/api/allowed/*`, `/api/instances/{id}/cancel`, `/api/instances/{id}/promote`, `/api/tg/react`, `/api/restart`, `/healthz` |
+| `internal/agent/extension/` | Embedded omp TS extension (`tg_react`, `trd_restart` tools) + system-prompt snippet, written to `~/.trd/ext/tg.ts` on startup |
 | `internal/media/media.go` | Whisper STT + VITS TTS via sherpa-onnx (CGo), OpenAI API fallback |
 | `internal/audio/audio.go` | OGG/Opus decode/encode (replaces ffmpeg) |
-| `internal/storage/storage.go` | bbolt: instances (with `SessionID`), allowlist, settings |
+| `internal/storage/storage.go` | bbolt: instances (with `SessionID`, `Controller`), allowlist, settings, `deferred_prompts` |
 | `internal/config/config.go` | Path helpers (`~/.trd/...`) + per-repo `<repo>/.trd/agent.json` (model/thinking) |
 | `internal/telegram/telegram.go` | Minimal hand-rolled Telegram Bot API client |
 
@@ -45,7 +46,7 @@ No cycles. Leaf packages (`config`, `storage`, `audio`, `telegram`, `agent`, `ap
 
 ## Dispatcher command handlers
 
-Telegram: `/start`, `/stop`, `/restart`, `/reset`, `/status`, `/watch`, `/cancel`, `/model`, `/effort`, `/debug`, `/forget`, `/help`. Non-commands → `routeToInstance` → `enqueueOrRun` → `driveAgentRun`.
+Telegram: `/start`, `/stop`, `/restart`, `/restart-self`, `/reset`, `/status`, `/watch`, `/cancel`, `/model`, `/effort`, `/debug`, `/forget`, `/help`. Non-commands → `routeToInstance` → `enqueueOrRun` → `driveAgentRun`.
 
 ## Agent event types
 
@@ -61,7 +62,7 @@ See `porting/PLAN.md` Appendix A for the source NDJSON shapes.
 
 ## Storage buckets
 
-`instances`, `by_topic`, `by_secret` (kept for backward-compat with old rows; `Secret` is unused after the headless port), `allowed_users`, `settings`. Always use Store methods — never read buckets directly.
+`instances`, `by_topic`, `by_secret` (legacy), `allowed_users`, `settings` (incl. `last_update_id`), `deferred_prompts`. Always use Store methods — never read buckets directly.
 
 ## Conventions
 
@@ -72,8 +73,9 @@ See `porting/PLAN.md` Appendix A for the source NDJSON shapes.
 - **`.trd/` is auto-gitignored** in cloned repos.
 - **CGo required** for sherpa-onnx (whisper + TTS) and libopus (audio codec).
 - **Env vars are persisted** to bbolt settings bucket on first start. Future restarts read from DB.
-- **omp gets a TS extension per spawn.** `internal/agent/extension/tg.ts` is embedded into the binary and written to `~/.trd/ext/tg.ts` on dispatcher start. Each `omp -p` run is invoked with `--extension <path>` + `--append-system-prompt <snippet>` and per-spawn env (`TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`). The extension registers a `tg_react(emoji)` tool; there is no automatic agent-side reaction (👀 lives on the dispatcher side).
+- **omp gets a TS extension per spawn.** `internal/agent/extension/tg.ts` is embedded into the binary and written to `~/.trd/ext/tg.ts` on dispatcher start. Each `omp -p` run is invoked with `--extension <path>` + `--append-system-prompt <snippet>` and per-spawn env (`TRD_CHAT_ID`, `TRD_MESSAGE_ID`, `TRD_DISPATCHER_URL`, `TRD_INSTANCE_ID`). Tools registered: `tg_react(emoji)` and `trd_restart()` (controller-only, gated by HTTP 403).
 - **Graceful shutdown.** On SIGINT/SIGTERM the dispatcher calls `Shutdown(5s)`: SIGINTs each in-flight omp child's pgid in parallel, waits for them to drain (SIGKILL on timeout), then waits for the `driveAgentRun` goroutines so the final Telegram reply lands before the process exits. Pending queued prompts are dropped.
+- **Self-restart.** `RequestRestart(callerID)` sets `pendingRestart`, flushes `pendingQueue` to bbolt `deferred_prompts`, and — when in-flight runs hit 0 — cancels Run so `cmdStart` can `syscall.Exec` the same binary in place. Authorisation: caller's instance must have `Controller=true` (set via `trd promote`). The successor process drains `deferred_prompts` before resuming the long-poll. See DEBUG.md §"Self-restart (implemented)".
 
 ## Debugging
 

@@ -42,6 +42,21 @@ type Handler interface {
 	// by the in-process omp extension (see internal/agent/extension) so
 	// the agent can 👍 a freshly-received user message.
 	ReactToMessage(chatID int64, messageID int, emoji string) error
+	// RequestRestart marks the dispatcher as pending a graceful restart.
+	// The dispatcher MUST drain in-flight runs and persist deferred
+	// prompts before re-executing itself. callerInstanceID is the
+	// claimed identity of the agent making the request (from the
+	// X-Trd-Instance header) — the implementation enforces controller
+	// authorisation. See DEBUG.md "Proposal C — controller-instance flag".
+	RequestRestart(callerInstanceID string) error
+	// PromoteController marks instanceIDOrPrefix as the controller and
+	// clears the flag on every other instance. Returns the canonical
+	// resolved instance id (so the CLI can print it) or an error when
+	// the prefix matches multiple/zero rows.
+	PromoteController(instanceIDOrPrefix string) (string, error)
+	// DemoteController clears the controller flag on
+	// instanceIDOrPrefix. Returns the canonical resolved instance id.
+	DemoteController(instanceIDOrPrefix string) (string, error)
 }
 
 // Server serves the dispatcher's HTTP endpoints.
@@ -69,6 +84,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("DELETE /api/allowed/{username}", s.handleAPIAllowedRemove)
 	mux.HandleFunc("POST /api/instances/{id}/cancel", s.handleAPIInstanceCancel)
 	mux.HandleFunc("POST /api/tg/react", s.handleAPIReact)
+	mux.HandleFunc("POST /api/restart", s.handleAPIRestart)
+	mux.HandleFunc("POST /api/instances/{id}/promote", s.handleAPIPromote)
+	mux.HandleFunc("DELETE /api/instances/{id}/promote", s.handleAPIDemote)
 
 	s.srv = &http.Server{
 		Addr:              s.addr,
@@ -182,4 +200,75 @@ func (s *Server) handleAPIReact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAPIRestart accepts a graceful-restart request from the in-process
+// omp extension. Authorisation is delegated to the dispatcher
+// (RequestRestart): the claimed instance id arrives in the
+// X-Trd-Instance header and must match an instance flagged as the
+// controller. Errors map to:
+//
+//	400 — missing header
+//	403 — non-controller (unauthorized)
+//	500 — any other failure
+//
+// On success returns 202 Accepted with a one-line plain-text body so
+// curl-from-shell looks reasonable.
+func (s *Server) handleAPIRestart(w http.ResponseWriter, r *http.Request) {
+	caller := r.Header.Get("X-Trd-Instance")
+	if caller == "" {
+		http.Error(w, "X-Trd-Instance header required", http.StatusBadRequest)
+		return
+	}
+	if err := s.h.RequestRestart(caller); err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("restart accepted; draining in-flight runs\n"))
+}
+
+// ErrUnauthorized is returned by Handler.RequestRestart when the calling
+// instance is not flagged as the controller. The API layer maps it to
+// HTTP 403.
+var ErrUnauthorized = errors.New("not authorized")
+
+// handleAPIPromote flips the controller flag on the requested instance.
+// {id} accepts the same prefix syntax as /cancel — repo-name match
+// first, then instance-id prefix. Returns the canonical resolved id as
+// a JSON {"instance_id":"…"} so the CLI can confirm.
+func (s *Server) handleAPIPromote(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	resolved, err := s.h.PromoteController(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"instance_id":"` + resolved + `"}`))
+}
+
+// handleAPIDemote clears the controller flag. Same prefix semantics as
+// promote. Returns the canonical id.
+func (s *Server) handleAPIDemote(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	resolved, err := s.h.DemoteController(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"instance_id":"` + resolved + `"}`))
 }

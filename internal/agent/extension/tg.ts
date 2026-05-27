@@ -6,6 +6,9 @@
 //
 //   TRD_CHAT_ID         numeric Telegram chat id
 //   TRD_MESSAGE_ID      numeric id of the message that triggered this run
+//   TRD_INSTANCE_ID     this run's instance UUID — used to authorise
+//                       the /api/restart endpoint (only the controller
+//                       instance is allowed to trigger a re-exec).
 //   TRD_DISPATCHER_URL  e.g. http://127.0.0.1:7777
 //
 // Two-mark visibility convention:
@@ -33,16 +36,18 @@ type Env = {
 	chatID: string;
 	messageID: string;
 	dispatcherURL: string;
+	instanceID: string;
 };
 
 function readEnv(): Env | null {
 	const chatID = process.env.TRD_CHAT_ID;
 	const messageID = process.env.TRD_MESSAGE_ID;
 	const dispatcherURL = process.env.TRD_DISPATCHER_URL;
-	if (!chatID || !messageID || !dispatcherURL) {
+	const instanceID = process.env.TRD_INSTANCE_ID;
+	if (!chatID || !messageID || !dispatcherURL || !instanceID) {
 		return null;
 	}
-	return { chatID, messageID, dispatcherURL };
+	return { chatID, messageID, dispatcherURL, instanceID };
 }
 
 async function postReact(env: Env, emoji: string, signal?: AbortSignal): Promise<Response> {
@@ -117,6 +122,84 @@ export default function trdExtension(pi: ExtensionAPI) {
 			} catch (err) {
 				return {
 					content: [{ type: "text", text: `tg_react: ${String(err)}` }],
+					details: { ok: false, reason: "fetch-failed" },
+				};
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "trd_restart",
+		label: "TRD Dispatcher Restart",
+		description:
+			"Trigger a graceful in-place restart of the TRD dispatcher. " +
+			"Drains every in-flight agent run, persists deferred prompts, " +
+			"then re-execs the dispatcher binary so live code updates are " +
+			"picked up without losing in-flight replies. ONLY callable from " +
+			"the controller instance (set via `trd promote <name>` on the " +
+			"host); other instances get HTTP 403 from the dispatcher. The " +
+			"currently-running turn is allowed to finish — call this once " +
+			"you have already sent any user-facing reply for the request.",
+		parameters: z.object({}),
+		async execute(_toolCallId, _params, _onUpdate, _ctx, signal) {
+			if (!env) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "trd_restart: dispatcher env not configured (TRD_INSTANCE_ID/TRD_DISPATCHER_URL missing)",
+						},
+					],
+					details: { ok: false, reason: "no-env" },
+				};
+			}
+			try {
+				const resp = await fetch(`${env.dispatcherURL}/api/restart`, {
+					method: "POST",
+					headers: {
+						"X-Trd-Instance": env.instanceID,
+					},
+					signal,
+				});
+				const body = await resp.text().catch(() => "");
+				if (resp.status === 403) {
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									"trd_restart: not authorised. This instance is not the controller. " +
+									"Run `trd promote <repo-name>` on the host to enable.",
+							},
+						],
+						details: { ok: false, status: 403 },
+					};
+				}
+				if (!resp.ok) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `trd_restart: HTTP ${resp.status} ${body}`.trim(),
+							},
+						],
+						details: { ok: false, status: resp.status },
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"trd_restart: accepted. Dispatcher will drain in-flight " +
+								"runs (including this one) and re-exec in place.",
+						},
+					],
+					details: { ok: true, status: resp.status },
+				};
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: `trd_restart: ${String(err)}` }],
 					details: { ok: false, reason: "fetch-failed" },
 				};
 			}

@@ -168,177 +168,70 @@ The reply the agent was about to produce is lost because the very act of
 asking for a restart kills the process responsible for delivering the
 reply.
 
-### Proposal A — graceful in-process self-restart (recommended)
+## Self-restart (implemented)
 
-Add a self-restart path that **the dispatcher** drives, so the calling
-`omp` is allowed to finish its turn before we re-exec.
+The three proposals below were merged into the live dispatcher. This
+section is the operational cheat-sheet for what's wired today;
+§ "Design rationale" preserves the original reasoning.
 
-**Wire.**
+### How to restart trd in production
 
-```
-POST /api/restart                      → 202 Accepted, "restarting after current runs drain"
-                                         403 if caller isn't authorized (see Proposal C)
-```
-
-Or a Telegram command in the controller topic:
-
-```
-/restart-self                          → equivalent to POSTing the above
-```
-
-**Semantics inside the dispatcher.**
-
-1. Set a `pendingRestart` flag under `runMu`. Reject new prompts that try to
-   spawn agents from this point on (queue them in bbolt instead, so the
-   successor picks them up — see "State that must survive" below).
-2. Let every in-flight run drain naturally. `driveAgentRun` finishes,
-   sends its Telegram reply, calls `finishRun`. The omp that triggered
-   the restart is one of those runs — it gets to deliver its message.
-3. When `len(d.runs) == 0`, the dispatcher:
-   - Closes the Telegram long-poll cleanly so we don't lose any updates.
-   - `Sync()` and `Close()` bbolt.
-   - Closes the HTTP listener.
-   - Calls `syscall.Exec(os.Args[0], os.Args, os.Environ())`.
-
-   `syscall.Exec` replaces the current process image *in place*. PID is
-   preserved; tmux/systemd don't observe a crash; no respawn loop needed.
-
-4. The successor starts, opens bbolt, sees its own queue of "deferred"
-   prompts (from step 1) and dispatches them.
-
-**State that must survive an in-place exec.**
-
-| Today | After |
+| You want… | Run |
 |---|---|
-| `runs` map (in memory) | Drained before exec; nothing to persist. |
-| `pendingQueue` map (in memory) | Must be persisted to a new `deferred_prompts` bbolt bucket so the successor picks them up. |
-| `Instance.SessionID` | Already in bbolt. Successor reads, passes `--resume`. Mid-flight conversation continuity is preserved. |
-| Long-poll `offset` | Currently in memory. Persist last-acked `update_id` to settings so we don't redeliver. |
+| Bounce after a code change (operator-driven) | `make restart` — uses `systemctl --user restart trd` when the unit is active, otherwise falls back to the legacy tmux path. |
+| Bounce from inside a Telegram turn (agent-driven, lossless) | `/restart-self` in the controller topic, or have the agent call its `trd_restart` tool. The dispatcher drains in-flight runs (the current reply still lands), persists queued prompts to bbolt, then `syscall.Exec`s in place — same PID, supervisor doesn't observe a crash. |
+| Authorise a topic to issue restarts | `trd promote <repo-name>` on the host. Exactly one controller at a time; `trd demote` clears the flag. |
+| Survive crash / OOM / host reboot | `make install-systemd` (one-time). `Restart=always` brings the dispatcher back in ~2s. |
 
-Last-acked `update_id` is the only new piece of state Telegram requires.
-Without it, the successor either replays the last batch (annoying for the
-user) or skips updates that arrived during the exec gap (worse).
+The two paths compose: in-place exec keeps `MainPID` stable so systemd
+stays satisfied; if exec itself fails (post-`Close()`, pre-`Exec()`) the
+supervisor still respawns us.
 
-**Acceptable degradations.**
+### What state survives an in-place exec
 
-- The originating turn's reply gets sent, but the user's confirmation
-  ("restart complete") arrives in a *new* run, kicked off by the
-  successor against the same topic. That's fine.
-- If something explodes between `Close()` and `Exec()`, the supervisor
-  (Proposal B) restarts us anyway — at worst we re-execute the same
-  startup path.
+| State | Mechanism |
+|---|---|
+| `runs` map | Drained before exec — never in flight across the boundary. |
+| `pendingQueue` (in-memory FIFOs) | Flushed to bbolt bucket `deferred_prompts` at `RequestRestart`; successor's `redeliverDeferredPrompts` re-routes through `enqueueOrRun`. |
+| Prompts that arrive *during* the drain | `enqueueOrRun` short-circuits to `deferred_prompts` while `pendingRestart` is set. |
+| `Instance.SessionID` | Already in bbolt — successor reads, passes `--resume`. Conversation continuity is preserved across the gap. |
+| Telegram long-poll offset | Persisted to `settings.last_update_id` after every non-empty batch; successor seeds `offset` from it. No redelivery, no skipped updates. |
 
-### Proposal B — external supervisor (systemd `--user` unit)
+### Authorisation in one line
 
-`tmux send-keys` is fine as a development affordance and useless as a
-production supervisor — it doesn't restart on crash, doesn't log rotate,
-doesn't sandbox.
+`POST /api/restart` requires header `X-Trd-Instance: <id>` matching an
+instance with `Controller=true`. The in-process omp extension sets the
+header from `TRD_INSTANCE_ID` (injected on every spawn). Non-controller
+→ 403. `/restart-self` in Telegram uses the same predicate on the
+topic's bound instance.
 
-A user-mode systemd unit takes over both jobs. Once installed, `make
-restart` becomes `systemctl --user restart trd`, and any unexpected exit
-brings the dispatcher right back.
+### Acceptable degradations
 
-**`~/.config/systemd/user/trd.service`** (sketch):
+- The originating turn's reply lands in the *outgoing* process; the
+  "restart complete" confirmation arrives in a *fresh* turn from the
+  successor. The user sees one extra round-trip, not a silent gap.
+- A prompt that arrives during the drain shows 👀 immediately (sent by
+  the outgoing process before exec) and 👍 only after the successor
+  picks it up. The two-mark visibility chain stays honest.
 
-```ini
-[Unit]
-Description=Telegram Repo Dispatcher
-After=network-online.target
+### Design rationale (kept for future readers)
 
-[Service]
-Type=exec
-ExecStart=%h/.local/bin/trd start
-Restart=always
-RestartSec=2
-# Keep stdio so `journalctl --user -u trd -f` works.
-StandardOutput=journal
-StandardError=journal
-# Don't kill omp children when the unit is stopped — they're in their own
-# pgroups and exit cleanly when their pipes close.
-KillMode=mixed
-TimeoutStopSec=10
+The original §"The restart-self problem" walk-through and the Proposals
+A/B/C lived here while the design was being argued. Their gist:
 
-[Install]
-WantedBy=default.target
-```
+- The naive `tmux send-keys C-c` path is fatal when an omp agent
+  triggers it from inside a turn — the act of asking for a restart
+  kills the process responsible for delivering the reply.
+- `syscall.Exec` after a clean drain (Proposal A) gives lossless
+  restart-from-within-a-turn.
+- A systemd `--user` unit (Proposal B) is the safety net for everything
+  else: crashes, OOMs, host reboots, exec-failed-mid-restart.
+- A single `Controller bool` per instance (Proposal C) is the minimum
+  auth gate that doesn't require sharing secrets or a new transport.
 
-Enable per-user lingering so the unit survives logout:
-
-```bash
-loginctl enable-linger "$USER"
-systemctl --user daemon-reload
-systemctl --user enable --now trd
-```
-
-**Interaction with Proposal A.** If `trd` re-execs in place (Proposal A),
-systemd does not observe the restart — same PID, `MainPID` stays valid.
-If something fails and `trd` *exits*, `Restart=always` brings it back in
-~2s. Either path keeps the dispatcher live; you choose between
-"transparent" (re-exec) and "supervised" (exit+respawn) per situation.
-
-**`make restart` becomes:**
-
-```makefile
-restart: install
-	@if systemctl --user is-active --quiet trd; then \
-	    systemctl --user restart trd; \
-	else \
-	    echo "trd unit not active — falling back to tmux"; \
-	    tmux send-keys -t trd C-c 2>/dev/null || true; sleep 1; \
-	    tmux send-keys -t trd '$(TRD_BIN) start' Enter; \
-	fi
-```
-
-(Both supervisors supported during the transition.)
-
-**What this still doesn't fix.** A `make restart` triggered by `omp`
-inside a turn *still* kills the parent. systemd just brings it back
-faster, but the in-flight reply is still lost. Proposal A is the actual
-fix for that path; Proposal B is the safety net for everything else
-(panics, crashes, OOMs, host reboots).
-
-### Proposal C — controller-instance flag
-
-`POST /api/restart` and `/restart-self` are dangerous — any agent that can
-shell out to `curl` could trigger them, and the HTTP API binds to
-`127.0.0.1` which means any process on the host has access.
-
-Authorize them by flagging one instance as the controller:
-
-```go
-type Instance struct {
-    // … existing fields …
-    Controller bool `json:"controller,omitempty"`
-}
-```
-
-- New CLI: `trd promote <name>` and `trd demote <name>` flip the flag.
-  Optionally: enforce at most one controller across the store.
-- `/restart-self` in Telegram: rejected unless the topic is bound to the
-  controller instance.
-- `POST /api/restart`: requires `X-Trd-Controller: <instance-id>`
-  matching the controller instance. The header is the agent's way of
-  proving it knows which instance it is — `omp` can read it from a
-  per-repo file (e.g. `.trd/controller-id`) that the dispatcher writes on
-  promotion.
-
-This is the minimum auth that doesn't require sharing secrets or
-deploying a new transport. It treats "is this the trd-self-development
-topic" as a single boolean in the store, which is exactly how the user
-already thinks about it.
-
-### Migration order (when someone implements this)
-
-1. Add the bbolt buckets (`deferred_prompts`, `last_update_id`) and the
-   long-poll offset persistence. This is risk-free and useful on its own.
-2. Add the `Controller` flag and the `promote`/`demote` CLI. Still inert.
-3. Add `POST /api/restart` that drains runs and calls `syscall.Exec`,
-   gated on the controller flag.
-4. Add `/restart-self` Telegram command, gated on the same flag.
-5. Ship the systemd unit and update `make restart` to prefer it.
-6. Mark `make restart`-via-tmux as deprecated for production use.
-
-Steps 1–4 are independent of 5–6; both halves are useful in isolation.
+The full original write-up (with sequence diagrams, the "What this
+still doesn't fix" caveats, the migration order) is in git history
+pre-implementation if you ever need to re-derive a decision.
 
 ## Operational checklist (current state)
 

@@ -1,4 +1,4 @@
-.PHONY: build build-all install install-models restart setup start test tidy clean install-deps lint
+.PHONY: build build-all install install-models install-systemd restart setup start test tidy clean install-deps lint
 
 GO ?= go
 
@@ -32,14 +32,33 @@ install-models:
 		tar xj --strip-components=1 -C ~/.trd/models/tts
 	@echo "Models installed to ~/.trd/models/"
 
-# Rebuild and bounce the dispatcher running in operator tmux session 'trd'.
-# Operator tmux is unrelated to per-instance agent management (which is now
-# one-shot omp subprocesses with no persistent state).
+# Rebuild and bounce the dispatcher.
+#
+# Preferred path: when the systemd --user unit is active, restart it.
+# That triggers the unit's KillMode=mixed -> SIGTERM, trd's
+# Shutdown() drain, then Restart=always re-launches the freshly
+# installed binary.
+#
+# Fallback: legacy tmux send-keys for hosts that haven't run
+# `make install-systemd` yet. Note this path is racy when the agent
+# itself triggers it — see DEBUG.md "The restart-self problem".
 restart: install
-	@echo "Restarting trd dispatcher in tmux session 'trd'..."
-	tmux send-keys -t trd C-c 2>/dev/null || true
-	sleep 1
-	tmux send-keys -t trd '$(TRD_BIN) start' Enter
+	@if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet trd 2>/dev/null; then \
+		echo "Restarting trd via systemd --user..."; \
+		systemctl --user restart trd; \
+	else \
+		echo "Restarting trd dispatcher in tmux session 'trd' (legacy path)..."; \
+		tmux send-keys -t trd C-c 2>/dev/null || true; \
+		sleep 1; \
+		tmux send-keys -t trd '$(TRD_BIN) start' Enter; \
+	fi
+
+# Install and enable the user systemd unit. After this runs:
+#   - trd is supervised by systemd --user (crashes/reboots respawn it)
+#   - `make restart` switches over to `systemctl --user restart trd`
+#   - Live logs: `journalctl --user -u trd -f`
+install-systemd: install
+	bash scripts/install-systemd.sh
 
 # First-time setup: builds, installs, and starts trd in an operator tmux
 # session. The tmux is purely for keeping the dispatcher process alive

@@ -1,0 +1,45 @@
+# trd — Telegram Repo Dispatcher
+#
+# User-mode systemd unit. Install with `make install-systemd` or the
+# install-systemd.sh script in this directory. See DEBUG.md
+# "Proposal B — external supervisor (systemd --user unit)".
+#
+# Interaction with the in-place self-restart (Proposal A): when trd
+# re-execs itself via syscall.Exec the PID is preserved, so MainPID
+# stays valid and systemd does NOT observe a restart. If trd actually
+# exits (panic, OOM, host reboot) Restart=always brings it back in ~2s.
+
+[Unit]
+Description=Telegram Repo Dispatcher (trd)
+Documentation=https://github.com/pomofomo/multi-omp-tg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# %h expands to the unit user's $HOME. `make install` puts trd here.
+ExecStart=%h/.local/bin/trd start
+Restart=always
+RestartSec=2
+
+# Stdio goes to the user journal: `journalctl --user -u trd -f` for live
+# logs. trd's own ~/.trd/trd.log still works in parallel; this just
+# guarantees we have a second copy outside the repo-managed dir.
+StandardOutput=journal
+StandardError=journal
+
+# KillMode=mixed sends SIGTERM to the main process and SIGKILL to its
+# control group children if they outlive TimeoutStopSec. trd handles
+# SIGTERM in Shutdown() to drain in-flight omp runs gracefully (up to
+# 5s); raise TimeoutStopSec if you want longer.
+KillMode=mixed
+TimeoutStopSec=10
+
+# Modest hardening. trd needs HOME (state DB, cloned repos), networking
+# (Telegram + omp's outbound API calls), and the ability to spawn omp.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
