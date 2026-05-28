@@ -179,7 +179,7 @@ section is the operational cheat-sheet for what's wired today;
 | You want… | Run |
 |---|---|
 | Bounce after a code change (operator-driven) | `make restart` — uses `systemctl --user restart trd` when the unit is active, otherwise falls back to the legacy tmux path. |
-| Bounce from inside a Telegram turn (agent-driven, lossless) | `/restart-self` in the controller topic, or have the agent call its `trd_restart` tool. The dispatcher drains in-flight runs (the current reply still lands), persists queued prompts to bbolt, then `syscall.Exec`s in place — same PID, supervisor doesn't observe a crash. |
+| Bounce from inside a Telegram turn (agent-driven, lossless) | `/restart_dispatcher` in the controller topic, or have the agent call its `trd_restart` tool. The dispatcher drains in-flight runs (the current reply still lands), persists queued prompts to bbolt, then `syscall.Exec`s in place — same PID, supervisor doesn't observe a crash. |
 | Authorise a topic to issue restarts | `trd promote <repo-name>` on the host. Exactly one controller at a time; `trd demote` clears the flag. |
 | Survive crash / OOM / host reboot | `make install-systemd` (one-time). `Restart=always` brings the dispatcher back in ~2s. |
 
@@ -211,7 +211,7 @@ supervisor still respawns us.
 `POST /api/restart` requires header `X-Trd-Instance: <id>` matching an
 instance with `Controller=true`. The in-process omp extension sets the
 header from `TRD_INSTANCE_ID` (injected on every spawn). Non-controller
-→ 403. `/restart-self` in Telegram uses the same predicate on the
+→ 403. `/restart_dispatcher` in Telegram uses the same predicate on the
 topic's bound instance.
 
 ### Acceptable degradations

@@ -37,7 +37,7 @@ Usage:
   trd allow   <username>          add a Telegram username to the allowlist
   trd deny    <username>          remove a Telegram username from the allowlist
   trd promote <name-or-prefix>    flag this instance as the controller
-                                  (authorises /restart_self & /api/restart)
+                                  (authorises /restart_dispatcher & /api/restart)
   trd demote  <name-or-prefix>    clear the controller flag
   trd allowed                     print the allowlist
 
@@ -453,7 +453,7 @@ func cmdPromote(args []string) {
 	if repo == "" {
 		repo = storage.RepoNameFromURL(inst.RepoURL)
 	}
-	fmt.Printf("promoted %s (%s) — /restart_self and /api/restart are now authorised in this instance\n",
+	fmt.Printf("promoted %s (%s) — /restart_dispatcher and /api/restart are now authorised in this instance\n",
 		repo, resolved[:8])
 }
 

@@ -4,7 +4,6 @@
 - Review all TG commands flags, remove unneeded ones, and ensure all supported ones show up in TG interface with help (/restart-self currently missing):
   - Keep: start, reset, status, model, effort, debug, cancel, forget, help
   - Remove: restart, watch, stop
-  - Add: restart-self (maybe others?)
 
 # Improvements
 

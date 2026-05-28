@@ -724,18 +724,15 @@ func (d *Dispatcher) pollLoop(ctx context.Context) error {
 
 	if err := d.tg.SetMyCommands(ctx, []telegram.BotCommand{
 		{Command: "start", Description: "Clone a repo and bind it to this topic: /start <git-url>"},
-		{Command: "stop", Description: "Cancel the in-flight agent run and mark the instance stopped"},
-		{Command: "restart", Description: "Re-enable the instance after /stop"},
 		{Command: "reset", Description: "Forget the session id; next message starts fresh"},
 		{Command: "status", Description: "Show instance, session, and run state"},
-		{Command: "watch", Description: "Tail recent agent log output for this topic"},
 		{Command: "model", Description: "Show or change model (e.g. /model opus)"},
 		{Command: "effort", Description: "Show or change thinking level (minimal, low, medium, high, xhigh)"},
 		{Command: "debug", Description: "Toggle dispatcher debug logging"},
 		{Command: "cancel", Description: "Interrupt the in-flight agent run for this topic"},
 		{Command: "forget", Description: "Delete the topic-repo mapping"},
 		{Command: "help", Description: "Show available commands"},
-		{Command: "restart_self", Description: "Controller-only: drain in-flight runs and re-exec the dispatcher in place"},
+		{Command: "restart_dispatcher", Description: "Controller-only: drain in-flight runs and re-exec the dispatcher in place"},
 	}); err != nil {
 		d.logger.Warn("setMyCommands failed", "err", err)
 	}
@@ -836,18 +833,12 @@ func (d *Dispatcher) handleMessage(ctx context.Context, m *telegram.Message) {
 		d.cmdStart(ctx, m, arg)
 	case text == "/start":
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Usage: /start <git-url>")
-	case text == "/stop":
-		d.cmdStop(ctx, m)
-	case text == "/restart":
-		d.cmdRestart(ctx, m)
-	case text == "/restart_self" || text == "/restart-self":
-		d.cmdRestartSelf(ctx, m)
+	case text == "/restart_dispatcher":
+		d.cmdRestartDispatcher(ctx, m)
 	case text == "/status":
 		d.cmdStatus(ctx, m)
 	case text == "/forget":
 		d.cmdForget(ctx, m)
-	case text == "/watch":
-		d.cmdWatch(ctx, m)
 	case text == "/reset":
 		d.cmdReset(ctx, m)
 	case text == "/debug":
@@ -965,29 +956,6 @@ func (d *Dispatcher) cmdStart(ctx context.Context, m *telegram.Message, repoURL 
 		fmt.Sprintf("Ready. Instance %s bound. Send a message to start the agent.", instID[:8]))
 }
 
-func (d *Dispatcher) cmdStop(ctx context.Context, m *telegram.Message) {
-	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
-	if inst == nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
-		return
-	}
-	_ = d.CancelRun(inst.InstanceID)
-	inst.State = storage.StateStopped
-	_ = d.store.Put(*inst)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Stopped. Use /restart to allow new messages, /reset to forget the session, or /forget to drop the mapping.")
-}
-
-func (d *Dispatcher) cmdRestart(ctx context.Context, m *telegram.Message) {
-	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
-	if inst == nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
-		return
-	}
-	inst.State = storage.StateRunning
-	inst.FailCount = 0
-	_ = d.store.Put(*inst)
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Ready. The next message will resume the existing session.")
-}
 
 func (d *Dispatcher) cmdReset(ctx context.Context, m *telegram.Message) {
 	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
@@ -1003,7 +971,7 @@ func (d *Dispatcher) cmdReset(ctx context.Context, m *telegram.Message) {
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "Reset — the next message will start a fresh agent session.")
 }
 
-// cmdRestartSelf triggers a dispatcher-wide graceful restart from the
+// cmdRestartDispatcher triggers a dispatcher-wide graceful restart from the
 // bound topic. The topic's instance must be flagged as the controller
 // (set via `trd promote`) — this is the same authorisation gate that
 // /api/restart enforces.
@@ -1012,7 +980,7 @@ func (d *Dispatcher) cmdReset(ctx context.Context, m *telegram.Message) {
 // (if any) is allowed to finish naturally; queued prompts are
 // persisted; then the process re-execs in place. A "restart complete"
 // confirmation lands in a fresh run after the successor process boots.
-func (d *Dispatcher) cmdRestartSelf(ctx context.Context, m *telegram.Message) {
+func (d *Dispatcher) cmdRestartDispatcher(ctx context.Context, m *telegram.Message) {
 	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
 	if inst == nil {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
@@ -1020,7 +988,7 @@ func (d *Dispatcher) cmdRestartSelf(ctx context.Context, m *telegram.Message) {
 	}
 	if !inst.Controller {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			"this topic's instance is not the controller — refusing /restart_self.\n"+
+			"this topic's instance is not the controller — refusing /restart_dispatcher.\n"+
 				"Run `trd promote "+inst.RepoName+"` on the host to authorise.")
 		return
 	}
@@ -1036,18 +1004,15 @@ func (d *Dispatcher) cmdHelp(ctx context.Context, m *telegram.Message) {
 	help := `TRD — Telegram Repo Dispatcher (omp headless mode)
 
 /start <git-url> — Clone a repo and bind it to this topic
-/stop — Cancel any in-flight run; reject new messages until /restart
-/restart — Re-enable the instance after /stop
 /reset — Forget the session id; next message starts fresh
 /status — Show instance, session, and run state
-/watch — Tail recent agent log output for this topic
 /model [name] — Show or change the model (e.g. /model opus)
 /effort [level] — Show or change thinking level (minimal, low, medium, high, xhigh)
 /cancel — Interrupt the in-flight agent run for this topic
 /debug — Toggle dispatcher debug logging
 /forget — Delete the topic-repo mapping
 /help — Show this message
-/restart_self — (controller-only) Drain in-flight runs and re-exec the dispatcher in place
+/restart_dispatcher — (controller-only) Drain in-flight runs and re-exec the dispatcher in place
 
 Anything else you type spawns omp -p in the bound repo.`
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, help)
@@ -1200,33 +1165,6 @@ func (d *Dispatcher) cmdForget(ctx context.Context, m *telegram.Message) {
 		return
 	}
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "forgotten. repo files at "+inst.RepoPath+" kept on disk.")
-}
-
-func (d *Dispatcher) cmdWatch(ctx context.Context, m *telegram.Message) {
-	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
-	if inst == nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no instance bound to this topic")
-		return
-	}
-	logPath, err := config.InstanceLogPath(inst.InstanceID)
-	if err != nil {
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "log path error: "+err.Error())
-		return
-	}
-	data, err := tailFile(logPath, 200, 4000)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "no log yet — send a message to spawn the agent first.")
-			return
-		}
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "read log failed: "+err.Error())
-		return
-	}
-	out := strings.TrimSpace(data)
-	if out == "" {
-		out = "(empty log)"
-	}
-	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, out)
 }
 
 func (d *Dispatcher) cmdCancel(ctx context.Context, m *telegram.Message) {

@@ -67,12 +67,9 @@ The repo is cloned and bound to the topic. Then talk to it. Send voice messages.
 | Command | Effect |
 |---------|--------|
 | `/start <git-url>` | Clone repo, bind to this topic |
-| `/stop` | Cancel any in-flight run; reject new messages until `/restart` |
-| `/restart` | Re-enable the instance after `/stop` |
-| `/restart_self` | Drain in-flight runs and re-exec the dispatcher in place. Controller-only — set with `trd promote <repo-name>`. |
+| `/restart_dispatcher` | Drain in-flight runs and re-exec the dispatcher in place. Controller-only — set with `trd promote <repo-name>`. |
 | `/reset` | Forget the omp session id; next message starts fresh |
 | `/status` | Show instance, session, run state, model, thinking level |
-| `/watch` | Tail recent agent log output for this topic |
 | `/model [name]` | Show or change the model (e.g. `/model opus`) |
 | `/effort [level]` | Show or change thinking level (`minimal`, `low`, `medium`, `high`, `xhigh`) |
 | `/cancel` | Interrupt the in-flight agent run for this topic |
@@ -89,7 +86,7 @@ trd shell <name>       # open shell in repo
 trd cd <name>          # print repo path
 trd stop <name>        # cancel any in-flight agent run
 trd allow <user>       # add to allowlist
-trd promote <name>     # flag this instance as the controller (authorises /restart_self & /api/restart)
+trd promote <name>     # flag this instance as the controller (authorises /restart_dispatcher & /api/restart)
 trd demote <name>      # clear the controller flag
 trd deny <user>        # remove from allowlist
 trd allowed            # show allowlist
