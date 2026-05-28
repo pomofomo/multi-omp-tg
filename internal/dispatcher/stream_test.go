@@ -116,19 +116,19 @@ func TestStreamingReplyAppendSendsPlaceholderAfterDebounce(t *testing.T) {
 func TestStreamingReplyDebouncesMultipleAppends(t *testing.T) {
 	rec := newStreamRecorder()
 	s := newTestStream(rec)
-	s.debounce = 40 * time.Millisecond
+	s.debounce = 100 * time.Millisecond
 	t.Cleanup(s.Close)
 
-	// Five appends each 10 ms apart: total span 40 ms, all under the
-	// 40 ms debounce window so only ONE send should fire after the
-	// last append plus debounce.
-	for _, w := range []string{"He", "llo", ", w", "or", "ld"} {
+	// Five appends in rapid succession, well under one debounce
+	// window total. Periodic-flush semantics: the first Append arms
+	// the timer, subsequent Appends just accumulate. Exactly one
+	// flush fires `debounce` later carrying the coalesced text.
+	for _, w := range []string{"He", "llo", ", ", "wor", "ld"} {
 		s.Append(w)
-		time.Sleep(10 * time.Millisecond)
 	}
-	waitForCond(t, 250*time.Millisecond, func() bool { return rec.sendCount() == 1 })
+	waitForCond(t, 300*time.Millisecond, func() bool { return rec.sendCount() == 1 })
 	if got := rec.lastSend().Text; got != "Hello, world" {
-		t.Errorf("coalesced text: got %q", got)
+		t.Errorf("coalesced text: got %q want %q", got, "Hello, world")
 	}
 	if rec.editCount() != 0 {
 		t.Errorf("no edits expected before any rollover/finalize: %d", rec.editCount())
@@ -391,4 +391,112 @@ func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("waitForCond: condition not met within %v", timeout)
+}
+
+// TestStreamingReplyFlushesPeriodicallyDuringSustainedBurst guards
+// against the regression where Append reset the debounce timer on each
+// delta. With reset-on-Append semantics, a continuous LLM burst (which
+// emits deltas every few ms — far faster than the 1.5 s production
+// debounce) would push the timer's deadline forward forever and the
+// placeholder would only ship at Finalize time. Streaming would be
+// indistinguishable from a one-shot send.
+//
+// Periodic-flush semantics: first delta arms the timer; subsequent
+// deltas accumulate without resetting; the tick fires once `debounce`
+// after the first, clears the timer, and the next delta re-arms.
+// Under sustained streaming this produces an edit per debounce window.
+func TestStreamingReplyFlushesPeriodicallyDuringSustainedBurst(t *testing.T) {
+	rec := newStreamRecorder()
+	s := newTestStream(rec)
+	s.debounce = 30 * time.Millisecond
+	t.Cleanup(s.Close)
+
+	// Drive deltas every 5 ms for ~150 ms total. With a 30 ms
+	// debounce window we expect ~5 flushes (one placeholder + ≥3
+	// edits). The exact count is timing-sensitive on a loaded CI;
+	// we just assert at least one edit happens — proving the timer
+	// fired during streaming, not only at Finalize.
+	const ticks = 30
+	for i := 0; i < ticks; i++ {
+		s.Append("x")
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Wait one more debounce window so any trailing tick completes.
+	time.Sleep(60 * time.Millisecond)
+
+	if rec.sendCount() != 1 {
+		t.Errorf("sustained burst should produce exactly one placeholder send, got %d", rec.sendCount())
+	}
+	if rec.editCount() < 1 {
+		t.Errorf("sustained burst must trigger at least one mid-stream edit (regression: timer-reset-on-Append starved the flush); got %d edits", rec.editCount())
+	}
+	// The last text Telegram saw must equal what we streamed.
+	final := rec.lastSend().Text
+	if rec.editCount() > 0 {
+		final = rec.lastEdit().Text
+	}
+	if final != s.Streamed() {
+		t.Errorf("final visible text drifted from streamed: got %q want %q", final, s.Streamed())
+	}
+}
+
+// TestStreamingReplyFinalizeSkipsRedundantEdit covers the second half
+// of the "message is not modified" fix: when streaming has already
+// shipped the canonical text, Finalize must NOT call edit (Telegram
+// returns HTTP 400). The user sees the same content, no warning.
+func TestStreamingReplyFinalizeSkipsRedundantEdit(t *testing.T) {
+	rec := newStreamRecorder()
+	s := newTestStream(rec)
+
+	// Send the placeholder with the full text.
+	s.Append("the canonical reply")
+	waitForCond(t, 250*time.Millisecond, func() bool { return rec.sendCount() == 1 })
+	if rec.editCount() != 0 {
+		t.Fatalf("setup: no edits expected yet, got %d", rec.editCount())
+	}
+
+	// Finalize with the same text — should be a no-op (no edit fired).
+	if err := s.Finalize(context.Background(), "the canonical reply"); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if rec.editCount() != 0 {
+		t.Errorf("Finalize fired a redundant edit (would 400 in real Telegram): %d edits, last=%q",
+			rec.editCount(), rec.lastEdit().Text)
+	}
+}
+
+// TestStreamingReplyEditNotModifiedTreatedAsBenign ensures Telegram's
+// "message is not modified" 400 doesn't propagate. If our local dedupe
+// misses (Telegram normalises whitespace differently than us), the
+// stream should still treat the operation as successful.
+func TestStreamingReplyEditNotModifiedTreatedAsBenign(t *testing.T) {
+	rec := newStreamRecorder()
+	s := newTestStream(rec)
+	t.Cleanup(s.Close)
+
+	s.Append("hello")
+	waitForCond(t, 250*time.Millisecond, func() bool { return rec.sendCount() == 1 })
+
+	// Inject the canonical "not modified" 400 on the next edit only.
+	rec.mu.Lock()
+	rec.editErr = errors.New("telegram editMessageText: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message (code=400)")
+	rec.editErrOn = 1
+	rec.mu.Unlock()
+
+	s.Append(" world")
+	// Wait for the tick to attempt the edit (it'll fail with our
+	// injected error; the recorder counts the attempt but doesn't
+	// append to edits[]).
+	waitForCond(t, 250*time.Millisecond, func() bool { return rec.editAttempts() >= 1 })
+
+	// lastSent should have advanced despite the "error" — that's the
+	// whole point of treating not-modified as success. The next
+	// Append + tick should produce exactly one more edit attempt
+	// (and this time succeed since editErrOn was 1-shot).
+	s.Append(" again")
+	waitForCond(t, 250*time.Millisecond, func() bool { return rec.editCount() == 1 })
+	if got := rec.lastEdit().Text; got != "hello world again" {
+		t.Errorf("post-not-modified edit text: got %q", got)
+	}
 }

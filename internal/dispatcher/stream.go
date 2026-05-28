@@ -116,11 +116,17 @@ func (s *streamingReply) Append(delta string) {
 	}
 	s.buf.WriteString(delta)
 	s.total.WriteString(delta)
+	// Periodic-flush debounce: the first append since the last tick
+	// arms a timer that fires `debounce` later. We DO NOT reset on
+	// subsequent appends — if we did, a continuous stream of deltas
+	// (typical for an LLM mid-burst, where deltas arrive every few
+	// ms) would keep pushing the deadline forward and nothing would
+	// ship until Finalize. That defeats the whole point of streaming.
+	// Once the tick fires it clears s.timer (see tick), so the next
+	// append re-arms the cycle.
 	if s.timer == nil {
 		s.timer = time.AfterFunc(s.debounce, s.tick)
-		return
 	}
-	s.timer.Reset(s.debounce)
 }
 
 // Streamed returns the concatenation of every delta we've seen. The
@@ -154,6 +160,7 @@ func (s *streamingReply) Finalize(ctx context.Context, text string) error {
 	defer s.mu.Unlock()
 	if s.timer != nil {
 		s.timer.Stop()
+		s.timer = nil
 	}
 	// Compute what should appear in the CURRENT message: the suffix of
 	// `text` that hasn't been written to a frozen message yet. If the
@@ -161,6 +168,15 @@ func (s *streamingReply) Finalize(ctx context.Context, text string) error {
 	// (uncommon — omp does it on retries sometimes), tail is empty and
 	// we just leave the current message as-is.
 	tail := remainderAfter(text, s.committedBytes)
+	// Common case: the canonical text equals what we've already
+	// streamed into the current message. Skip the Edit — Telegram
+	// would return "message is not modified" (HTTP 400) and the user
+	// already sees the right thing. Only skip when at least one
+	// message has been sent; otherwise we still need the initial send.
+	if s.currentID != 0 && tail == s.lastSent {
+		s.closed = true
+		return nil
+	}
 	s.buf.Reset()
 	s.buf.WriteString(tail)
 	err := s.flushLocked(ctx, true)
@@ -175,6 +191,7 @@ func (s *streamingReply) Close() {
 	s.closed = true
 	if s.timer != nil {
 		s.timer.Stop()
+		s.timer = nil
 	}
 }
 
@@ -189,6 +206,10 @@ func (s *streamingReply) tick() {
 	if s.closed {
 		return
 	}
+	// Clear the timer reference so a subsequent Append in the same
+	// streaming burst will re-arm. Without this we'd flush exactly
+	// once per stream — the first time deltas paused for `debounce`.
+	s.timer = nil
 	if err := s.flushLocked(ctx, false); err != nil {
 		s.logger.Debug("stream: tick flush errored",
 			"instance", s.instanceLog, "err", err)
@@ -264,10 +285,17 @@ func (s *streamingReply) editOrSendLocked(ctx context.Context, text string) erro
 		Text:      text,
 	})
 	if err != nil {
-		// Common benign cases: "message is not modified" (we already
-		// deduped, but Telegram occasionally normalises whitespace
-		// differently), and HTTP 429 (debounce will retry on the next
-		// tick or on Finalize). Don't crash the stream.
+		// "message is not modified" (HTTP 400) means Telegram already
+		// shows exactly this text. Defense in depth: Finalize and
+		// flushLocked already dedupe locally, but Telegram normalises
+		// whitespace slightly differently in rare cases. Treat as
+		// success — lastSent advances so we don't retry the same text.
+		if strings.Contains(err.Error(), "message is not modified") {
+			s.lastSent = text
+			return nil
+		}
+		// Other failures (HTTP 429, network errors). Don't advance
+		// lastSent — the next tick will retry with current buf.
 		s.logger.Debug("stream: edit failed",
 			"instance", s.instanceLog, "msg_id", s.currentID, "err", err)
 		return err
