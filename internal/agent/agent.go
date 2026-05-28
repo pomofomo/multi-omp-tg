@@ -35,6 +35,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // Kind classifies an Event for switch-case consumers.
@@ -204,6 +205,32 @@ func (r *Run) Cancel(grace time.Duration) {
 	}
 }
 
+// MaxPromptBytes caps the prompt passed to `omp -p` as its final argv
+// entry. Linux's ARG_MAX is typically 128KB on stack-limited hosts; we
+// truncate at half that so a runaway voice transcript can never blow up
+// exec(). Truncation is best-effort: the tail still reflects what the
+// user said up to the limit.
+const MaxPromptBytes = 64 * 1024
+
+// safeTruncate cuts s to at most n bytes on a UTF-8 rune boundary, then
+// appends a trailing "… [truncated]" marker so the agent can tell the
+// input was clipped.
+func safeTruncate(s string, n int) string {
+	const marker = "… [truncated]"
+	if len(s) <= n {
+		return s
+	}
+	budget := n - len(marker)
+	if budget <= 0 {
+		return marker[:n]
+	}
+	// Walk backwards from budget to the nearest rune boundary.
+	for budget > 0 && !utf8.RuneStart(s[budget]) {
+		budget--
+	}
+	return s[:budget] + marker
+}
+
 // Start spawns omp -p with the requested options and returns immediately.
 // A background goroutine reads stdout, parses NDJSON, emits events on the
 // returned Run's Events channel, and closes the channel when the process
@@ -219,6 +246,13 @@ func Start(ctx context.Context, opts RunOptions) (*Run, error) {
 	}
 	if opts.Prompt == "" {
 		return nil, errors.New("agent.Start: Prompt is required")
+	}
+	// Cap the prompt argv at MaxPromptBytes. Linux's argv+env limit is
+	// typically 128KB on stack-restricted hosts; we truncate at half that
+	// so a multi-megabyte voice transcript can never bust exec(). The cut
+	// is on a UTF-8 rune boundary to keep the tail readable.
+	if len(opts.Prompt) > MaxPromptBytes {
+		opts.Prompt = safeTruncate(opts.Prompt, MaxPromptBytes)
 	}
 
 	args := []string{"-p", "--mode", "json"}

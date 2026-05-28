@@ -53,3 +53,74 @@ func TestSynthesizeNotConfigured(t *testing.T) {
 		t.Errorf("expected ErrNotConfigured, got %v", err)
 	}
 }
+
+func TestChunkForWhisperShortPassesThrough(t *testing.T) {
+	// 25 seconds → must be a single chunk (no scan, no cost).
+	samples := make([]float32, 25*whisperSampleRate)
+	chunks := chunkForWhisper(samples)
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk for 25s audio, got %d", len(chunks))
+	}
+	if len(chunks[0]) != len(samples) {
+		t.Errorf("chunk length %d != input length %d", len(chunks[0]), len(samples))
+	}
+}
+
+func TestChunkForWhisperExactly30sPassesThrough(t *testing.T) {
+	// Whisper accepts up to 30s; 29s sits comfortably below the cap.
+	samples := make([]float32, 29*whisperSampleRate)
+	chunks := chunkForWhisper(samples)
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk for 29s audio, got %d", len(chunks))
+	}
+}
+
+func TestChunkForWhisperLongAudioSplits(t *testing.T) {
+	// 75 seconds with a single uniform loud signal. With no silence to
+	// snap to we still must split, and every chunk must be ≤30s.
+	samples := make([]float32, 75*whisperSampleRate)
+	for i := range samples {
+		samples[i] = 0.5
+	}
+	chunks := chunkForWhisper(samples)
+	if len(chunks) < 2 {
+		t.Fatalf("expected ≥2 chunks for 75s audio, got %d", len(chunks))
+	}
+	var total int
+	for i, c := range chunks {
+		total += len(c)
+		if len(c) > 30*whisperSampleRate {
+			t.Errorf("chunk %d length %d exceeds 30s window", i, len(c))
+		}
+		if len(c) == 0 {
+			t.Errorf("chunk %d is empty", i)
+		}
+	}
+	if total != len(samples) {
+		t.Errorf("chunks total %d samples, input had %d (lost or duplicated)", total, len(samples))
+	}
+}
+
+func TestChunkForWhisperPrefersSilenceBreak(t *testing.T) {
+	// 60s of "speech" (full-amplitude) with one ~200ms silent gap planted
+	// at 26s. The chunker should snap the first cut to that gap rather
+	// than the bare 28s ideal-cut.
+	samples := make([]float32, 60*whisperSampleRate)
+	for i := range samples {
+		samples[i] = 0.5
+	}
+	gapStart := 26 * whisperSampleRate
+	gapEnd := gapStart + whisperSampleRate/5 // 200ms
+	for i := gapStart; i < gapEnd; i++ {
+		samples[i] = 0
+	}
+	chunks := chunkForWhisper(samples)
+	if len(chunks) < 2 {
+		t.Fatalf("expected ≥2 chunks, got %d", len(chunks))
+	}
+	firstCut := len(chunks[0])
+	if firstCut < gapStart || firstCut > gapEnd {
+		t.Errorf("first cut at sample %d (%.2fs); expected inside silent gap [%d, %d]",
+			firstCut, float64(firstCut)/float64(whisperSampleRate), gapStart, gapEnd)
+	}
+}

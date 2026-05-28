@@ -1,5 +1,5 @@
-# Improvements
+# Quality
 
-- Support longer voice messages. As per this log: May 28 07:22:42 omp-dev trd[38316]: /workspace/sherpa-onnx/csrc/offline-recognizer-whisper-impl.h:DecodeStream:97 Only waves less than 30 seconds are supported. We process only the first 30 seconds and discard the remaining data
-- Better text to speech models, at least flag. There is a high quality version of the same speech model to try first, otherwise we can try using kokoro in onnx (not the python version which is super slow)
+- This file needs to be updated properly or maybe a sim-link to internal/agent/extension/tg.ts in this repo: /home/pomofomo/.trd/ext/tg.ts
+Log: May 28 08:15:57 omp-dev trd[47568]: time=2026-05-28T08:15:57.295Z level=INFO msg="agent spawn" instance=7f15239c msg_id=126 extension_loaded=true extension_path=/home/pomofomo/.trd/ext/tg.ts sys_prompt_chars=1315 env_vars=6 tts_available=true
 

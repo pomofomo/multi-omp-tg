@@ -266,6 +266,18 @@ func (e *Engine) Synthesize(ctx context.Context, text, outDir string) (string, e
 
 // --- Whisper transcription ---
 
+// Whisper has a hard 30-second window per decode pass (sherpa-onnx logs
+// "Only waves less than 30 seconds are supported" and silently drops the
+// rest). For longer audio we split into ≤maxChunkSeconds segments, prefer
+// cut points that land on a low-energy frame (i.e. a likely word/sentence
+// gap), and concatenate the partial transcripts.
+const (
+	whisperSampleRate = 16000
+	maxChunkSeconds   = 28 // safety margin under the 30s hard cap
+	lookbackSeconds   = 3  // search window before the ideal cut for a silence
+	silenceFrameSize  = 320 // 20ms at 16kHz
+)
+
 func (e *Engine) transcribeSherpa(_ context.Context, audioPath string) (string, error) {
 	// Decode audio to PCM float32 at 16kHz (sherpa-onnx whisper expects this).
 	var samples []float32
@@ -280,7 +292,7 @@ func (e *Engine) transcribeSherpa(_ context.Context, audioPath string) (string, 
 		samples = wave.Samples
 	case ".ogg", ".oga", ".opus":
 		var err error
-		samples, err = audio.DecodeOGGOpus(audioPath, 16000)
+		samples, err = audio.DecodeOGGOpus(audioPath, whisperSampleRate)
 		if err != nil {
 			return "", fmt.Errorf("decode OGG/Opus: %w", err)
 		}
@@ -295,14 +307,84 @@ func (e *Engine) transcribeSherpa(_ context.Context, audioPath string) (string, 
 	e.whisperMu.Lock()
 	defer e.whisperMu.Unlock()
 
-	stream := sherpa.NewOfflineStream(e.whisper)
-	defer sherpa.DeleteOfflineStream(stream)
+	chunks := chunkForWhisper(samples)
+	var parts []string
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		stream := sherpa.NewOfflineStream(e.whisper)
+		stream.AcceptWaveform(whisperSampleRate, chunk)
+		e.whisper.Decode(stream)
+		text := strings.TrimSpace(stream.GetResult().Text)
+		sherpa.DeleteOfflineStream(stream)
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " "), nil
+}
 
-	stream.AcceptWaveform(16000, samples)
-	e.whisper.Decode(stream)
+// chunkForWhisper slices PCM samples into ≤maxChunkSeconds segments,
+// preferring cut points on a low-energy frame inside a 3s lookback window
+// so we don't slice mid-word. Audio at/under 29s is returned as a single
+// chunk (one segment, no scan overhead).
+func chunkForWhisper(samples []float32) [][]float32 {
+	maxChunk := maxChunkSeconds * whisperSampleRate
+	// Whisper still accepts up to 30s; only split when we're genuinely over.
+	if len(samples) <= 29*whisperSampleRate {
+		return [][]float32{samples}
+	}
 
-	result := stream.GetResult()
-	return strings.TrimSpace(result.Text), nil
+	// Pre-compute per-frame RMS once; reused for every cut search.
+	nFrames := len(samples) / silenceFrameSize
+	energies := make([]float32, nFrames)
+	for i := 0; i < nFrames; i++ {
+		var sum float64
+		base := i * silenceFrameSize
+		for j := 0; j < silenceFrameSize; j++ {
+			v := float64(samples[base+j])
+			sum += v * v
+		}
+		energies[i] = float32(math.Sqrt(sum / float64(silenceFrameSize)))
+	}
+
+	lookback := lookbackSeconds * whisperSampleRate
+	var chunks [][]float32
+	offset := 0
+	for offset < len(samples) {
+		remaining := len(samples) - offset
+		if remaining <= 30*whisperSampleRate {
+			chunks = append(chunks, samples[offset:])
+			break
+		}
+		idealCut := offset + maxChunk
+		// Quietest frame inside [idealCut-lookback, idealCut].
+		startFrame := (idealCut - lookback) / silenceFrameSize
+		endFrame := idealCut / silenceFrameSize
+		if startFrame < offset/silenceFrameSize+1 {
+			startFrame = offset/silenceFrameSize + 1
+		}
+		if endFrame > nFrames {
+			endFrame = nFrames
+		}
+		cut := idealCut
+		if startFrame < endFrame {
+			bestFrame := startFrame
+			for f := startFrame + 1; f < endFrame; f++ {
+				if energies[f] < energies[bestFrame] {
+					bestFrame = f
+				}
+			}
+			cut = bestFrame * silenceFrameSize
+		}
+		if cut <= offset {
+			cut = idealCut // safety: never advance backwards
+		}
+		chunks = append(chunks, samples[offset:cut])
+		offset = cut
+	}
+	return chunks
 }
 
 func (e *Engine) transcribeOpenAI(ctx context.Context, audioPath string) (string, error) {

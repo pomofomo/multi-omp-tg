@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The tests in this file drive Start() against a fake omp binary. The
@@ -48,6 +49,12 @@ func TestMain(m *testing.M) {
 	case "bad-json":
 		fakeOMPBadJSON()
 	case "empty":
+		os.Exit(0)
+	case "argv_dump":
+		dump := os.Getenv("TRD_AGENT_TEST_ARGV_DUMP")
+		if dump != "" {
+			_ = os.WriteFile(dump, []byte(strings.Join(os.Args, "\x00")), 0o644)
+		}
 		os.Exit(0)
 	case "exit-fail":
 		emit(map[string]any{"type": "session", "id": "exit-fail"})
@@ -633,4 +640,73 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func TestSafeTruncateBelowLimit(t *testing.T) {
+	s := "hello world"
+	if got := safeTruncate(s, 1024); got != s {
+		t.Errorf("safeTruncate shrank a string already under the cap: %q", got)
+	}
+}
+
+func TestSafeTruncateExactLimit(t *testing.T) {
+	s := strings.Repeat("a", 64)
+	if got := safeTruncate(s, 64); got != s {
+		t.Errorf("safeTruncate touched an exact-fit string: len=%d", len(got))
+	}
+}
+
+func TestSafeTruncateClipsAndMarks(t *testing.T) {
+	s := strings.Repeat("a", 200)
+	got := safeTruncate(s, 64)
+	if len(got) > 64 {
+		t.Errorf("safeTruncate exceeded cap: len=%d", len(got))
+	}
+	if !strings.HasSuffix(got, "[truncated]") {
+		t.Errorf("expected truncation marker, got %q", got)
+	}
+}
+
+func TestSafeTruncateRespectsUTF8Boundary(t *testing.T) {
+	// "🙂" is 4 bytes. Build a string where the naive byte cut would land
+	// in the middle of a multi-byte rune.
+	s := strings.Repeat("🙂", 64) // 256 bytes
+	got := safeTruncate(s, 100)
+	if len(got) > 100 {
+		t.Errorf("safeTruncate exceeded cap: len=%d", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("safeTruncate produced invalid UTF-8: %q", got)
+	}
+}
+
+func TestStartCapsPromptAtMaxPromptBytes(t *testing.T) {
+	// Spawn the test binary as a fake omp that echoes argv back via a
+	// dedicated mode; assert the prompt argv arrived at ≤MaxPromptBytes.
+	t.Setenv("TRD_AGENT_TEST_FAKE_OMP_MODE", "argv_dump")
+	t.Setenv("TRD_OMP_BIN", os.Args[0])
+	dumpPath := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("TRD_AGENT_TEST_ARGV_DUMP", dumpPath)
+	huge := strings.Repeat("a", MaxPromptBytes*3)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	run, err := Start(ctx, RunOptions{Cwd: t.TempDir(), Prompt: huge})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for range run.Events() {
+	}
+
+	raw, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("read dump: %v", err)
+	}
+	args := strings.Split(string(raw), "\x00")
+	prompt := args[len(args)-1]
+	if len(prompt) > MaxPromptBytes {
+		t.Errorf("prompt arg len %d exceeds MaxPromptBytes %d", len(prompt), MaxPromptBytes)
+	}
+	if !strings.HasSuffix(prompt, "[truncated]") {
+		t.Errorf("expected truncation marker on capped prompt; tail=%q", prompt[len(prompt)-32:])
+	}
 }
