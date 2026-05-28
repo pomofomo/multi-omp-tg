@@ -26,9 +26,10 @@ install-models:
 	mkdir -p ~/.trd/models/whisper
 	curl -SL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.en.tar.bz2 | \
 		tar xj --strip-components=1 -C ~/.trd/models/whisper
-	@echo "Downloading TTS model (lessac-medium, ~64MB)..."
+	@echo "Downloading TTS model (lessac-high, ~109MB)..."
 	mkdir -p ~/.trd/models/tts
-	curl -SL https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium.tar.bz2 | \
+	rm -rf ~/.trd/models/tts/*
+	curl -SL https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-high.tar.bz2 | \
 		tar xj --strip-components=1 -C ~/.trd/models/tts
 	@echo "Models installed to ~/.trd/models/"
 
