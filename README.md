@@ -10,8 +10,8 @@ A single Go binary connects to your Telegram bot. For each forum topic bound to 
 
 1. The first user message clones the repo (on `/start`).
 2. Every subsequent message spawns `omp -p` in that repo, with `--resume` pointed at the omp session id captured from the previous run.
-3. omp's reply (text only, for now) is forwarded back to the topic.
-4. Voice messages are transcribed (whisper) and prefixed to the prompt; the dispatcher does not currently emit outbound voice.
+3. omp's reply streams back to the topic as live-edited Telegram messages (debounced ~1.5s, automatic 4000-char roll-over), and the agent can also emit voice-memo replies via a TTS tool.
+4. Voice messages from the user are transcribed (whisper) and prefixed to the prompt.
 
 There is **no persistent agent process**, no tmux per instance, no WebSocket bridge, no MCP channel plugin. Each user message is a one-shot subprocess; conversation continuity lives in omp's own session storage at `~/.omp/agent/sessions/`.
 
@@ -69,6 +69,7 @@ The repo is cloned and bound to the topic. Then talk to it. Send voice messages.
 | `/start <git-url>` | Clone repo, bind to this topic |
 | `/stop` | Cancel any in-flight run; reject new messages until `/restart` |
 | `/restart` | Re-enable the instance after `/stop` |
+| `/restart-self` | Drain in-flight runs and re-exec the dispatcher in place. Controller-only — set with `trd promote <repo-name>`. |
 | `/reset` | Forget the omp session id; next message starts fresh |
 | `/status` | Show instance, session, run state, model, thinking level |
 | `/watch` | Tail recent agent log output for this topic |
@@ -88,6 +89,8 @@ trd shell <name>       # open shell in repo
 trd cd <name>          # print repo path
 trd stop <name>        # cancel any in-flight agent run
 trd allow <user>       # add to allowlist
+trd promote <name>     # flag this instance as the controller (authorises /restart-self & /api/restart)
+trd demote <name>      # clear the controller flag
 trd deny <user>        # remove from allowlist
 trd allowed            # show allowlist
 ```
@@ -102,17 +105,17 @@ trd allowed            # show allowlist
 
 The next `omp -p` invocation in that repo passes `--model` and `--thinking` from this file. Use `/model -` or `/effort -` to clear back to omp's default.
 
-## Voice messages
+## Voice
 
-Send a voice note in a topic — TRD transcribes it with embedded whisper and prefixes the text to the prompt that omp receives.
+**Inbound** — send a voice note in a topic and TRD transcribes it with embedded whisper, prefixing the text to the prompt that omp receives.
+
+**Outbound** — the agent can speak back. The omp extension registers a `tg_voice(text)` tool: when called, the dispatcher synthesises the text via its embedded TTS (sherpa-onnx VITS, or OpenAI TTS if `TRD_OPENAI_API_KEY` is set) and ships it as an OGG/Opus voice memo threaded to the originating message. The bot decides when to use voice; the description steers it toward short conversational replies (acks, quick status updates) and away from anything with code, links, or markdown.
 
 ```bash
 make install-models     # downloads whisper + TTS models to ~/.trd/models/
 ```
 
 Models are auto-detected at `~/.trd/models/`. No ffmpeg needed.
-
-Outbound TTS (`send_voice`) is **not** implemented in the headless port — omp replies with text only.
 
 ## User allowlist
 
@@ -168,6 +171,7 @@ See [DEV.md](./DEV.md) for the developer guide.
 | Doc | What's in it |
 |-----|-------------|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, message flows, key decisions |
+| [DEBUG.md](./DEBUG.md) | Operational debugging notes, case studies, self-restart docs |
 | [DEV.md](./DEV.md) | Contributing, code layout, debugging, env vars |
 | [CLAUDE.md](./CLAUDE.md) | Key context for an agent editing this repo |
 | [TECH_STACK.md](./TECH_STACK.md) | Languages, libraries, system dependencies |

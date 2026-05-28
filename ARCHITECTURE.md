@@ -215,17 +215,15 @@ No WebSocket. No auth (binds to `127.0.0.1` only).
 | Persistent agent sessions ("Claude" running in tmux) | Bounded memory: zero idle processes |
 | Live TUI capture (`/watch` showed the terminal) | `/watch` reads a clean log file |
 | Manager mode (delegation between instances) | Simpler architecture; delegation can be re-added as an HTTP endpoint |
-| Outbound TTS (`send_voice` tool) | Plan documents how to re-add via a sentinel marker |
+| Outbound TTS (`send_voice` tool) | `tg_voice` tool: omp posts text, dispatcher synthesises via `media.Engine` and uploads as OGG/Opus voice memo |
 | `/model` and `/effort` as interactive Claude commands | Per-repo `.trd/agent.json` is greppable and version-able |
-| Real-time streaming of assistant tokens | Final reply only (follow-up: stream via Telegram `editMessageText`) |
+| Real-time streaming of assistant tokens | Debounced live edits via `streamingReply` (1.5s debounce, 4000-char roll-over) — `internal/dispatcher/stream.go` |
 
 ## Roadmap
 
 Roughly prioritized:
 
-- Streaming Telegram edits during a run (so long replies feel live).
 - Delegation between instances via `POST /api/delegate`.
-- Re-add outbound TTS — sentinel marker in assistant text → dispatcher synthesizes and sends voice.
 - Auto-download inbound photos (pre-fetch instead of attachment dance).
 - CI / release automation (GitHub Actions → tagged releases with prebuilt binaries per host arch).
 - Branch-aware topics (git worktrees).

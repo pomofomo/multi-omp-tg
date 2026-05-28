@@ -107,6 +107,12 @@ type Dispatcher struct {
 	sendMessage func(ctx context.Context, p telegram.SendMessageParams) (telegram.Message, error)
 	setReaction func(ctx context.Context, chatID int64, msgID int, emoji string) error
 
+	// editMessage updates an existing Telegram message in place. The
+	// streamingReply state machine uses it to live-edit a placeholder
+	// as the agent emits deltas (see stream.go). Default wires to
+	// d.tg.EditMessageText.
+	editMessage func(ctx context.Context, p telegram.EditMessageTextParams) error
+
 	// sendVoice uploads an OGG/Opus file as a Telegram voice note.
 	// Defaults to d.tg.SendVoice; tests substitute a fake that records
 	// the upload without hitting the wire.
@@ -242,6 +248,7 @@ func New(opts Options) (*Dispatcher, error) {
 	}
 	d.sendMessage = d.tg.SendMessage
 	d.setReaction = d.tg.SetReaction
+	d.editMessage = d.tg.EditMessageText
 	d.sendVoice = d.tg.SendVoice
 	d.synthesize = d.media.Synthesize
 	d.canSynthesize = d.media.CanSynthesize
@@ -1430,10 +1437,13 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 	d.runMu.Unlock()
 
 	var (
-		assistantBuf strings.Builder
-		sawFinal     bool
-		hadError     bool
-		errText      string
+		stream    *streamingReply // nil until first delta — lazy so a
+		                          // deltaless turn keeps the historic
+		                          // one-shot send path
+		finalText string          // canonical content from EvAssistantFinal
+		sawFinal  bool
+		hadError  bool
+		errText   string
 	)
 
 	for ev := range h.Events() {
@@ -1451,14 +1461,21 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 				}
 			}
 		case agent.EvAssistantDelta:
-			// Initial port collects deltas and sends once at the end.
-			// Streaming Telegram edits is a documented follow-up.
-			assistantBuf.WriteString(ev.Text)
+			if stream == nil {
+				stream = newStreamingReply(
+					d.sendMessage, d.editMessage,
+					p.chatID, p.thread, p.msgID,
+					d.logger, shortID(inst.InstanceID),
+				)
+			}
+			stream.Append(ev.Text)
 		case agent.EvAssistantFinal:
-			// Prefer the final text over the accumulated deltas — it is
-			// the canonical content omp wants us to surface.
-			assistantBuf.Reset()
-			assistantBuf.WriteString(ev.Text)
+			// The canonical content omp wants us to surface. We don't
+			// commit it to Telegram until the channel closes — that
+			// lets a post-final EvError still annotate the same
+			// message in one shot rather than triggering a separate
+			// edit.
+			finalText = ev.Text
 			sawFinal = true
 		case agent.EvError:
 			if sawFinal {
@@ -1482,7 +1499,14 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 		}
 	}
 
-	reply := assistantBuf.String()
+	// Compose the user-visible reply. finalText (from EvAssistantFinal)
+	// is preferred; if omp died before message_end we fall back to
+	// whatever we streamed; otherwise we emit a stub so the user knows
+	// something went wrong.
+	reply := finalText
+	if reply == "" && stream != nil {
+		reply = stream.Streamed()
+	}
 	if hadError && reply == "" {
 		reply = "agent error: " + errText
 	} else if hadError {
@@ -1492,12 +1516,32 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 		if !sawFinal {
 			reply = "(agent produced no reply — see /watch for details)"
 		} else {
+			// sawFinal=true with empty text — historical no-op return
+			// (used when an upstream agent intentionally suppresses
+			// the reply). Close the stream so no late edit fires.
+			if stream != nil {
+				stream.Close()
+			}
 			return
 		}
 	}
 
 	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	if stream != nil {
+		// Streaming path: finalize the in-flight message with the
+		// canonical text (possibly rolling over into more messages if
+		// the final text is longer than what we streamed).
+		if err := stream.Finalize(bgCtx, reply); err != nil {
+			d.logger.Warn("stream finalize failed",
+				"instance", shortID(inst.InstanceID), "err", err)
+		}
+		return
+	}
+
+	// Non-streaming path: no deltas ever arrived. Send the reply as a
+	// fresh message (or multiple, when it exceeds the chunk size).
 	for i, chunk := range splitMessage(reply, 4000) {
 		replyTo := 0
 		if i == 0 {

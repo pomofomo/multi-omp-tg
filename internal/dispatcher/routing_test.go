@@ -104,12 +104,19 @@ type recordingTelegram struct {
 	mu        sync.Mutex
 	sent      []telegram.SendMessageParams
 	reactions []reaction
+	edits     []editEvent
 }
 
 type reaction struct {
 	chatID int64
 	msgID  int
 	emoji  string
+}
+
+type editEvent struct {
+	chatID  int64
+	msgID   int
+	text    string
 }
 
 func (r *recordingTelegram) sendMessage(_ context.Context, p telegram.SendMessageParams) (telegram.Message, error) {
@@ -119,6 +126,37 @@ func (r *recordingTelegram) sendMessage(_ context.Context, p telegram.SendMessag
 	return telegram.Message{MessageID: 9999}, nil
 }
 
+
+func (r *recordingTelegram) editMessage(_ context.Context, p telegram.EditMessageTextParams) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.edits = append(r.edits, editEvent{chatID: p.ChatID, msgID: p.MessageID, text: p.Text})
+	return nil
+}
+
+func (r *recordingTelegram) sentMessages() []telegram.SendMessageParams {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]telegram.SendMessageParams, len(r.sent))
+	copy(out, r.sent)
+	return out
+}
+
+func (r *recordingTelegram) editTexts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.edits))
+	for i, e := range r.edits {
+		out[i] = e.text
+	}
+	return out
+}
+
+func (r *recordingTelegram) editCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.edits)
+}
 func (r *recordingTelegram) setReaction(_ context.Context, chatID int64, msgID int, emoji string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -163,6 +201,7 @@ func newTestDispatcher(t *testing.T, r *fakeRunner) (*Dispatcher, *recordingTele
 		runs:         map[string]*agentRun{},
 		pendingQueue: map[string][]queuedPrompt{},
 	}
+	d.editMessage = rec.editMessage
 	// Voice tool seams. Default to "TTS unavailable, never called" so
 	// tests that don't exercise tg_voice behave like a host without TTS.
 	// Tests that need to verify voice routing override these directly.
@@ -673,4 +712,96 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("waitFor: condition not met within %v", timeout)
+}
+
+// TestDriveAgentRunStreamsDeltasIncrementally verifies that the
+// streaming wiring is engaged when omp emits text deltas. Because the
+// production 1.5 s debounce can collapse a synchronous burst of deltas
+// into a single Send (the desirable fast-path optimisation), we assert
+// the user-visible contract — exactly one message lands, replies to
+// the originating message, and ends up with the canonical text — and
+// leave the placeholder+edit timing to the stream_test.go unit tests
+// which control debounce directly.
+func TestDriveAgentRunStreamsDeltasIncrementally(t *testing.T) {
+	r := &fakeRunner{emit: []agent.Event{
+		{Kind: agent.EvSessionID, SessionID: "sess-stream"},
+		{Kind: agent.EvAssistantDelta, Text: "Hello"},
+		{Kind: agent.EvAssistantDelta, Text: ", "},
+		{Kind: agent.EvAssistantDelta, Text: "world"},
+		{Kind: agent.EvAssistantFinal, Text: "Hello, world!"},
+	}}
+	d, rec := newTestDispatcher(t, r)
+
+	inst := storage.Instance{
+		InstanceID: "stream-1",
+		ChatID:     1, TopicID: 1,
+		RepoPath: t.TempDir(),
+		State:    storage.StateRunning,
+	}
+	if err := d.store.Put(inst); err != nil {
+		t.Fatal(err)
+	}
+
+	d.enqueueOrRun(inst, queuedPrompt{
+		chatID: 1, thread: 1, msgID: 555, text: "say hi",
+	})
+
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+
+	waitFor(t, 3*time.Second, func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return len(rec.sent) >= 1
+	})
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.sent) != 1 {
+		t.Fatalf("expected exactly 1 send for streaming reply, got %d", len(rec.sent))
+	}
+	if rec.sent[0].ReplyToMessageID != 555 {
+		t.Errorf("placeholder must reply-to original msg 555, got %d",
+			rec.sent[0].ReplyToMessageID)
+	}
+	// Final visible text is either carried by the Send (fast deltas
+	// collapsed before debounce) or by the last Edit (debounce fired
+	// at least once mid-stream). Either is correct streaming output.
+	visible := rec.sent[0].Text
+	if len(rec.edits) > 0 {
+		visible = rec.edits[len(rec.edits)-1].text
+	}
+	if visible != "Hello, world!" {
+		t.Errorf("final visible text: got %q want %q", visible, "Hello, world!")
+	}
+}
+
+// TestDriveAgentRunNonStreamingPathUnchanged guards the one-shot path
+// that pre-streaming tests already depend on: a turn with only
+// EvAssistantFinal (no deltas) goes through sendMessage with no edits.
+func TestDriveAgentRunNonStreamingPathUnchanged(t *testing.T) {
+	r := &fakeRunner{emit: []agent.Event{
+		{Kind: agent.EvAssistantFinal, Text: "bare reply"},
+	}}
+	d, rec := newTestDispatcher(t, r)
+
+	inst := storage.Instance{
+		InstanceID: "bare-1",
+		ChatID:     1, TopicID: 1,
+		RepoPath: t.TempDir(),
+		State:    storage.StateRunning,
+	}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 1, text: "hi"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+	waitFor(t, 2*time.Second, func() bool { return len(rec.sentTexts()) == 1 })
+
+	if got := rec.sentTexts()[0]; got != "bare reply" {
+		t.Errorf("non-streaming send: got %q", got)
+	}
+	if got := rec.editCount(); got != 0 {
+		t.Errorf("non-streaming path should not edit, got %d edits", got)
+	}
 }
