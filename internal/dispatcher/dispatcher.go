@@ -735,7 +735,7 @@ func (d *Dispatcher) pollLoop(ctx context.Context) error {
 		{Command: "cancel", Description: "Interrupt the in-flight agent run for this topic"},
 		{Command: "forget", Description: "Delete the topic-repo mapping"},
 		{Command: "help", Description: "Show available commands"},
-		{Command: "restart-self", Description: "(controller only) Drain in-flight runs and re-exec the dispatcher in place"},
+		{Command: "restart_self", Description: "Controller-only: drain in-flight runs and re-exec the dispatcher in place"},
 	}); err != nil {
 		d.logger.Warn("setMyCommands failed", "err", err)
 	}
@@ -840,7 +840,7 @@ func (d *Dispatcher) handleMessage(ctx context.Context, m *telegram.Message) {
 		d.cmdStop(ctx, m)
 	case text == "/restart":
 		d.cmdRestart(ctx, m)
-	case text == "/restart-self":
+	case text == "/restart_self" || text == "/restart-self":
 		d.cmdRestartSelf(ctx, m)
 	case text == "/status":
 		d.cmdStatus(ctx, m)
@@ -1020,7 +1020,7 @@ func (d *Dispatcher) cmdRestartSelf(ctx context.Context, m *telegram.Message) {
 	}
 	if !inst.Controller {
 		d.sendText(ctx, m.Chat.ID, m.MessageThreadID,
-			"this topic's instance is not the controller — refusing /restart-self.\n"+
+			"this topic's instance is not the controller — refusing /restart_self.\n"+
 				"Run `trd promote "+inst.RepoName+"` on the host to authorise.")
 		return
 	}
@@ -1047,7 +1047,7 @@ func (d *Dispatcher) cmdHelp(ctx context.Context, m *telegram.Message) {
 /debug — Toggle dispatcher debug logging
 /forget — Delete the topic-repo mapping
 /help — Show this message
-/restart-self — (controller-only) Drain in-flight runs and re-exec the dispatcher in place
+/restart_self — (controller-only) Drain in-flight runs and re-exec the dispatcher in place
 
 Anything else you type spawns omp -p in the bound repo.`
 	d.sendText(ctx, m.Chat.ID, m.MessageThreadID, help)
@@ -1450,14 +1450,30 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 	run.handle = h
 	d.runMu.Unlock()
 
+	runStartedAt := time.Now()
+	d.logger.Info("agent run started",
+		"instance", shortID(inst.InstanceID),
+		"msg_id", p.msgID,
+		"resume", inst.SessionID != "")
+
 	var (
-		stream    *streamingReply // nil until first delta — lazy so a
-		                          // deltaless turn keeps the historic
-		                          // one-shot send path
-		finalText string          // canonical content from EvAssistantFinal
-		sawFinal  bool
-		hadError  bool
-		errText   string
+		stream      *streamingReply // nil until first delta — lazy so a
+		                            // deltaless turn keeps the historic
+		                            // one-shot send path
+		finalBuf    strings.Builder // accumulates the text content of every
+		                            // EvAssistantFinal in this turn. omp
+		                            // emits one per assistant segment, so a
+		                            // turn with tool calls fires multiple
+		                            // (text → tool → text → tool → text…).
+		                            // Overwriting would leave us with just
+		                            // the last segment — see the bug from
+		                            // 2026-05-28 where Finalize replaced
+		                            // the streamed reply with "just the
+		                            // last chunk".
+		segments    int
+		sawFinal    bool
+		hadError    bool
+		errText     string
 	)
 
 	for ev := range h.Events() {
@@ -1484,13 +1500,15 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 			}
 			stream.Append(ev.Text)
 		case agent.EvAssistantFinal:
-			// The canonical content omp wants us to surface. We don't
-			// commit it to Telegram until the channel closes — that
-			// lets a post-final EvError still annotate the same
-			// message in one shot rather than triggering a separate
-			// edit.
-			finalText = ev.Text
+			finalBuf.WriteString(ev.Text)
+			segments++
 			sawFinal = true
+			d.logger.Info("agent: final segment",
+				"instance", shortID(inst.InstanceID),
+				"segment", segments, "len", len(ev.Text))
+		case agent.EvToolCall:
+			d.logger.Info("agent: tool call",
+				"instance", shortID(inst.InstanceID), "tool", ev.Text)
 		case agent.EvError:
 			if sawFinal {
 				// omp already produced its canonical message_end; the only
@@ -1513,13 +1531,24 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 		}
 	}
 
-	// Compose the user-visible reply. finalText (from EvAssistantFinal)
-	// is preferred; if omp died before message_end we fall back to
-	// whatever we streamed; otherwise we emit a stub so the user knows
-	// something went wrong.
-	reply := finalText
-	if reply == "" && stream != nil {
+	// Compose the user-visible reply.
+	//
+	// Streaming path: stream.Streamed() is what the user has been
+	// watching grow on Telegram. It's already the right canonical text;
+	// finalBuf (the concatenation of every message_end segment) should
+	// equal it, but we don't trust that equality — if omp emitted a
+	// retry mid-stream or our deltas missed a few bytes from a partial
+	// scanner read, the streamed text is what the user saw, so honour
+	// that. Falling back to finalBuf only when streaming never started.
+	//
+	// Non-streaming path (no deltas ever arrived): use finalBuf as the
+	// only source of canonical text.
+	var reply string
+	switch {
+	case stream != nil:
 		reply = stream.Streamed()
+	default:
+		reply = finalBuf.String()
 	}
 	if hadError && reply == "" {
 		reply = "agent error: " + errText
@@ -1536,12 +1565,30 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 			if stream != nil {
 				stream.Close()
 			}
+			d.logger.Info("agent run finished (empty reply, no-op)",
+				"instance", shortID(inst.InstanceID),
+				"segments", segments)
 			return
 		}
 	}
 
 	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Log on every exit path (Finalize OR splitMessage send), pulling
+	// the values captured up to this point. defer here so the message
+	// shows up after every reply branch including early returns added
+	// later.
+	defer func() {
+		d.logger.Info("agent run finished",
+			"instance", shortID(inst.InstanceID),
+			"msg_id", p.msgID,
+			"duration", time.Since(runStartedAt).Round(time.Millisecond),
+			"reply_chars", len(reply),
+			"segments", segments,
+			"streamed", stream != nil,
+			"had_error", hadError)
+	}()
 
 	if stream != nil {
 		// Streaming path: finalize the in-flight message with the

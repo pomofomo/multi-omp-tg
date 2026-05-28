@@ -348,6 +348,11 @@ func TestSplitAtBoundary(t *testing.T) {
 		{"raw cut, no newline", "abcdefghij", 4, "abcd", "efghij"},
 		{"newline in window prefers boundary", "abc\ndef", 5, "abc", "def"},
 		{"newline at very start kept verbatim", "\nabcdef", 4, "\nabc", "def"},
+		{"sentence boundary (.)", "first sentence. second one continues here", 20, "first sentence.", "second one continues here"},
+		{"sentence boundary (!)", "wow that's neat! more here", 18, "wow that's neat!", "more here"},
+		{"sentence boundary (?)", "really? yes really again", 12, "really?", "yes really again"},
+		{"space fallback when no sentence", "alpha beta gamma delta", 12, "alpha beta", "gamma delta"},
+		{"newline beats space and period", "first.\nsecond. third", 14, "first.", "second. third"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

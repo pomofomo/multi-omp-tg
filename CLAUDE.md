@@ -46,7 +46,7 @@ No cycles. Leaf packages (`config`, `storage`, `audio`, `telegram`, `agent`, `ap
 
 ## Dispatcher command handlers
 
-Telegram: `/start`, `/stop`, `/restart`, `/restart-self`, `/reset`, `/status`, `/watch`, `/cancel`, `/model`, `/effort`, `/debug`, `/forget`, `/help`. Non-commands → `routeToInstance` → `enqueueOrRun` → `driveAgentRun`.
+Telegram: `/start`, `/stop`, `/restart`, `/restart_self`, `/reset`, `/status`, `/watch`, `/cancel`, `/model`, `/effort`, `/debug`, `/forget`, `/help`. Non-commands → `routeToInstance` → `enqueueOrRun` → `driveAgentRun`.
 
 ## Agent event types
 

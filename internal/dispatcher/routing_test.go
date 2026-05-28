@@ -728,7 +728,7 @@ func TestDriveAgentRunStreamsDeltasIncrementally(t *testing.T) {
 		{Kind: agent.EvAssistantDelta, Text: "Hello"},
 		{Kind: agent.EvAssistantDelta, Text: ", "},
 		{Kind: agent.EvAssistantDelta, Text: "world"},
-		{Kind: agent.EvAssistantFinal, Text: "Hello, world!"},
+		{Kind: agent.EvAssistantFinal, Text: "Hello, world"},
 	}}
 	d, rec := newTestDispatcher(t, r)
 
@@ -764,15 +764,71 @@ func TestDriveAgentRunStreamsDeltasIncrementally(t *testing.T) {
 		t.Errorf("placeholder must reply-to original msg 555, got %d",
 			rec.sent[0].ReplyToMessageID)
 	}
-	// Final visible text is either carried by the Send (fast deltas
-	// collapsed before debounce) or by the last Edit (debounce fired
-	// at least once mid-stream). Either is correct streaming output.
+	// Final visible text is the concatenation of streamed deltas
+	// (NOT the message_end content). This guards the 2026-05-28 bug
+	// where multi-segment turns (text → tool → text) saw their full
+	// streamed reply overwritten by just the last segment's
+	// message_end content. The streamed buffer is the source of
+	// truth — it's what the user has been watching grow.
 	visible := rec.sent[0].Text
 	if len(rec.edits) > 0 {
 		visible = rec.edits[len(rec.edits)-1].text
 	}
-	if visible != "Hello, world!" {
-		t.Errorf("final visible text: got %q want %q", visible, "Hello, world!")
+	if visible != "Hello, world" {
+		t.Errorf("final visible text: got %q want %q (streamed buf)", visible, "Hello, world")
+	}
+}
+
+// TestDriveAgentRunMultiSegmentTurnAccumulates exercises the
+// 2026-05-28 regression directly: when omp emits multiple
+// EvAssistantFinal events in a single turn (one per text segment
+// between tool calls), the streamed deltas — which the user has been
+// watching grow — must remain visible at the end. Pre-fix, the last
+// segment's message_end overwrote the buffer and Finalize replaced
+// the entire reply with just that last segment.
+func TestDriveAgentRunMultiSegmentTurnAccumulates(t *testing.T) {
+	r := &fakeRunner{emit: []agent.Event{
+		// Segment 1: "Reading the file..."
+		{Kind: agent.EvAssistantDelta, Text: "Reading "},
+		{Kind: agent.EvAssistantDelta, Text: "the file..."},
+		{Kind: agent.EvAssistantFinal, Text: "Reading the file..."},
+		// Simulated tool call between segments. The tool event itself
+		// is not consumed by the dispatcher (we just log it), so its
+		// presence or absence here doesn't affect the test.
+		{Kind: agent.EvToolCall, Text: "read"},
+		// Segment 2: "Done!"
+		{Kind: agent.EvAssistantDelta, Text: "Done!"},
+		{Kind: agent.EvAssistantFinal, Text: "Done!"},
+	}}
+	d, rec := newTestDispatcher(t, r)
+
+	inst := storage.Instance{
+		InstanceID: "multi-1",
+		ChatID:     1, TopicID: 1,
+		RepoPath: t.TempDir(),
+		State:    storage.StateRunning,
+	}
+	_ = d.store.Put(inst)
+
+	d.enqueueOrRun(inst, queuedPrompt{chatID: 1, thread: 1, msgID: 7, text: "read it"})
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	drainHandle(t, d, inst.InstanceID, r.pendingAt(0))
+	waitFor(t, 3*time.Second, func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return len(rec.sent) >= 1
+	})
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	visible := rec.sent[0].Text
+	if len(rec.edits) > 0 {
+		visible = rec.edits[len(rec.edits)-1].text
+	}
+	const want = "Reading the file...Done!"
+	if visible != want {
+		t.Errorf("multi-segment final text: got %q want %q (regression: last segment overwrote full reply)",
+			visible, want)
 	}
 }
 

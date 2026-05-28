@@ -54,6 +54,10 @@ const (
 	// EvError surfaces any non-recoverable error (API overloaded, malformed
 	// JSON, omp process failure). Text is a human-readable message.
 	EvError
+	// EvToolCall surfaces a tool execution: omp's `tool_execution_start`
+	// NDJSON event. Text carries the tool name (so log lines stay short);
+	// the full Raw payload is also attached for callers that want args.
+	EvToolCall
 	// EvDone is emitted exactly once when the omp process exits cleanly.
 	// Consumers MUST treat this as the final event in the stream — the
 	// channel will be closed immediately after.
@@ -73,6 +77,8 @@ func (k Kind) String() string {
 		return "error"
 	case EvDone:
 		return "done"
+	case EvToolCall:
+		return "tool_call"
 	}
 	return fmt.Sprintf("kind(%d)", int(k))
 }
@@ -417,6 +423,19 @@ func classify(line []byte) (Event, bool) {
 			Raw:  cloneRaw(line),
 		}, true
 
+
+	case "tool_execution_start":
+		var t struct {
+			ToolName string `json:"toolName"`
+		}
+		if err := json.Unmarshal(line, &t); err != nil || t.ToolName == "" {
+			return Event{}, false
+		}
+		return Event{
+			Kind: EvToolCall,
+			Text: t.ToolName,
+			Raw:  cloneRaw(line),
+		}, true
 	default:
 		// agent_start, turn_start, turn_end, agent_end, message_start,
 		// model_change, thinking_level_change, auto_retry_start, …

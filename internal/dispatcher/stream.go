@@ -305,15 +305,42 @@ func (s *streamingReply) editOrSendLocked(ctx context.Context, text string) erro
 }
 
 // splitAtBoundary returns (head, tail) where head is the largest prefix
-// of s no longer than max bytes, preferring to cut at the last newline
-// in that range. If no newline exists in the prefix, falls back to a
-// raw cut at max. The cut newline is dropped (head doesn't include it,
-// tail doesn't either) so the user sees a clean break between messages.
+// of s no longer than max bytes, cutting at the most natural boundary
+// we can find in the window [0, max). Preference order:
+//
+//	1. Last newline (paragraph or hard line break)
+//	2. Last sentence terminator followed by space (". ", "! ", "? ")
+//	3. Last whitespace (word boundary)
+//	4. Raw cut at max (only when none of the above exist — rare for
+//	   natural prose, but happens with code blocks or jammed-together
+//	   text without spaces)
+//
+// The boundary character is dropped from both head and tail (so " "
+// and "\n" don't show up doubled or as leading whitespace on the next
+// message). For ". " etc. we keep the punctuation on head and drop
+// only the trailing space.
 func splitAtBoundary(s string, max int) (head, tail string) {
 	if len(s) <= max {
 		return s, ""
 	}
-	if i := strings.LastIndex(s[:max], "\n"); i > 0 {
+	window := s[:max]
+
+	if i := strings.LastIndex(window, "\n"); i > 0 {
+		return s[:i], s[i+1:]
+	}
+	// Sentence terminators followed by space. Check each independently
+	// and take whichever lands latest.
+	bestSentence := -1
+	for _, sep := range []string{". ", "! ", "? "} {
+		if i := strings.LastIndex(window, sep); i > bestSentence {
+			// Cut after the punctuation, drop the trailing space.
+			bestSentence = i + 1
+		}
+	}
+	if bestSentence > 0 {
+		return s[:bestSentence], s[bestSentence+1:]
+	}
+	if i := strings.LastIndex(window, " "); i > 0 {
 		return s[:i], s[i+1:]
 	}
 	return s[:max], s[max:]
