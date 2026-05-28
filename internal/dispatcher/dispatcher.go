@@ -498,15 +498,21 @@ func (d *Dispatcher) ListInstances() ([]byte, error) {
 // to stall the agent's first turn.
 func (d *Dispatcher) ReactToMessage(chatID int64, messageID int, emoji string) error {
 	if chatID == 0 || messageID == 0 || emoji == "" {
+		d.logger.Warn("tg_react: invalid args",
+			"chat", chatID, "msg_id", messageID, "emoji", emoji)
 		return errors.New("react: chat_id, message_id, and emoji are required")
 	}
+	d.logger.Info("tg_react: tool fired",
+		"chat", chatID, "msg_id", messageID, "emoji", emoji)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := d.setReaction(ctx, chatID, messageID, emoji); err != nil {
-		d.logger.Debug("react via api failed", "chat", chatID, "msg_id", messageID, "err", err)
+		d.logger.Warn("tg_react: setReaction failed",
+			"chat", chatID, "msg_id", messageID, "emoji", emoji, "err", err)
 		return err
 	}
-	d.logger.Debug("react via api", "chat", chatID, "msg_id", messageID, "emoji", emoji)
+	d.logger.Info("tg_react: applied",
+		"chat", chatID, "msg_id", messageID, "emoji", emoji)
 	return nil
 }
 
@@ -1412,6 +1418,14 @@ func (d *Dispatcher) driveAgentRun(ctx context.Context, inst storage.Instance, r
 			fmt.Sprintf("TRD_TTS_AVAILABLE=%t", d.canSynthesize()),
 		}
 	}
+	d.logger.Info("agent spawn",
+		"instance", shortID(inst.InstanceID),
+		"msg_id", p.msgID,
+		"extension_loaded", d.extPath != "",
+		"extension_path", d.extPath,
+		"sys_prompt_chars", len(sysPromptAppend),
+		"env_vars", len(extraEnv),
+		"tts_available", d.canSynthesize())
 
 	h, err := d.runner.Start(ctx, agent.RunOptions{
 		Cwd:                inst.RepoPath,

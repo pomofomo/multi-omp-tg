@@ -189,16 +189,24 @@ func (s *Server) handleAPIInstanceCancel(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleAPIReact(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("POST /api/tg/react", "remote", r.RemoteAddr, "content_length", r.ContentLength)
 	var body struct {
 		ChatID    int64  `json:"chat_id"`
 		MessageID int    `json:"message_id"`
 		Emoji     string `json:"emoji"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.logger.Warn("POST /api/tg/react: invalid json", "err", err)
 		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	s.logger.Info("POST /api/tg/react payload",
+		"chat_id", body.ChatID, "message_id", body.MessageID, "emoji", body.Emoji)
+
 	if body.ChatID == 0 || body.MessageID == 0 || body.Emoji == "" {
+		s.logger.Warn("POST /api/tg/react: missing required fields",
+			"chat_id", body.ChatID, "message_id", body.MessageID, "emoji", body.Emoji)
 		http.Error(w, "chat_id, message_id, and emoji are required", http.StatusBadRequest)
 		return
 	}
