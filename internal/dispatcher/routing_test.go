@@ -861,3 +861,123 @@ func TestDriveAgentRunNonStreamingPathUnchanged(t *testing.T) {
 		t.Errorf("non-streaming path should not edit, got %d edits", got)
 	}
 }
+
+// TestResolveInstancePrefersTopicBinding: when (chat, thread) has a
+// stored Instance, resolveInstance returns it untouched and never
+// looks at the controller.
+func TestResolveInstancePrefersTopicBinding(t *testing.T) {
+	d, _ := newTestDispatcher(t, &fakeRunner{})
+
+	bound := storage.Instance{InstanceID: "bound", ChatID: 1, TopicID: 7, RepoPath: t.TempDir(), State: storage.StateRunning}
+	ctrl := storage.Instance{InstanceID: "ctrl", ChatID: 1, TopicID: 99, RepoPath: t.TempDir(), State: storage.StateRunning, Controller: true}
+	if err := d.store.Put(bound); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.store.Put(ctrl); err != nil {
+		t.Fatal(err)
+	}
+
+	got, fellBack, err := d.resolveInstance(1, 7)
+	if err != nil {
+		t.Fatalf("resolveInstance: %v", err)
+	}
+	if got == nil || got.InstanceID != "bound" {
+		t.Fatalf("want bound instance; got %+v", got)
+	}
+	if fellBack {
+		t.Errorf("fellBackToController should be false when topic is bound")
+	}
+}
+
+// TestResolveInstanceFallsBackToController: when no instance is bound
+// to (chat, thread) — the common case for forwards, which Telegram's
+// UI always drops in General — resolveInstance returns the running
+// controller.
+func TestResolveInstanceFallsBackToController(t *testing.T) {
+	d, _ := newTestDispatcher(t, &fakeRunner{})
+
+	ctrl := storage.Instance{InstanceID: "ctrl", ChatID: 1, TopicID: 99, RepoPath: t.TempDir(), State: storage.StateRunning, Controller: true}
+	if err := d.store.Put(ctrl); err != nil {
+		t.Fatal(err)
+	}
+
+	got, fellBack, err := d.resolveInstance(1, 0)
+	if err != nil {
+		t.Fatalf("resolveInstance: %v", err)
+	}
+	if got == nil || got.InstanceID != "ctrl" {
+		t.Fatalf("want controller; got %+v", got)
+	}
+	if !fellBack {
+		t.Errorf("fellBackToController should be true when only controller matched")
+	}
+}
+
+// TestResolveInstanceNoFallbackWhenControllerStopped: a controller
+// that's been /stopped (or marked failed) must NOT be picked as the
+// fallback — silently swallowing forwards is better than spawning a
+// run we know won't progress.
+func TestResolveInstanceNoFallbackWhenControllerStopped(t *testing.T) {
+	d, _ := newTestDispatcher(t, &fakeRunner{})
+
+	ctrl := storage.Instance{InstanceID: "ctrl", ChatID: 1, TopicID: 99, RepoPath: t.TempDir(), State: storage.StateStopped, Controller: true}
+	if err := d.store.Put(ctrl); err != nil {
+		t.Fatal(err)
+	}
+
+	got, fellBack, _ := d.resolveInstance(1, 0)
+	if got != nil {
+		t.Errorf("stopped controller must not be returned: %+v", got)
+	}
+	if fellBack {
+		t.Errorf("fellBack should stay false when no candidate qualifies")
+	}
+}
+
+// TestRouteToInstanceForwardLandsInGeneral simulates the exact scenario
+// that motivated the fallback: a message arrives in thread=0 (General)
+// where nothing is bound; the running controller picks it up; replies
+// go to General (queuedPrompt carries the originating chat/thread, NOT
+// the controller's bound topic).
+func TestRouteToInstanceForwardLandsInGeneral(t *testing.T) {
+	r := &fakeRunner{emit: []agent.Event{
+		{Kind: agent.EvAssistantFinal, Text: "ack the forward"},
+	}}
+	d, rec := newTestDispatcher(t, r)
+
+	// Controller bound to topic 99; the forward lands in 0 (General).
+	ctrl := storage.Instance{InstanceID: "ctrl", ChatID: 1, TopicID: 99, RepoPath: t.TempDir(), State: storage.StateRunning, Controller: true}
+	if err := d.store.Put(ctrl); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &telegram.Message{
+		MessageID:       321,
+		MessageThreadID: 0, // General — Telegram's forward landing zone
+		From:            &telegram.User{Username: "ethansf"},
+		Chat:            telegram.Chat{ID: 1, Type: "supergroup", IsForum: true},
+		Text:            "[forwarded content]",
+	}
+	d.routeToInstance(context.Background(), m, m.Text)
+
+	waitFor(t, 2*time.Second, func() bool { return r.callCount() == 1 })
+	if got := r.lastCall().Prompt; got != "[forwarded content]" {
+		t.Errorf("forward prompt: got %q", got)
+	}
+	drainHandle(t, d, ctrl.InstanceID, r.pendingAt(0))
+	waitFor(t, 2*time.Second, func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return len(rec.sent) == 1
+	})
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	got := rec.sent[0]
+	if got.MessageThreadID != 0 {
+		t.Errorf("reply must go to General (thread=0), got thread=%d", got.MessageThreadID)
+	}
+	if got.ReplyToMessageID != 321 {
+		t.Errorf("reply must thread off the originating msg 321, got %d", got.ReplyToMessageID)
+	}
+}

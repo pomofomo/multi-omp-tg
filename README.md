@@ -77,6 +77,10 @@ The repo is cloned and bound to the topic. Then talk to it. Send voice messages.
 | `/forget` | Delete the topic-repo mapping |
 | `/help` | Show available commands |
 
+### Forwarded messages
+
+Telegram's forward UI doesn't let you pick a topic — every forward lands in the supergroup's General/main thread. When that happens, TRD routes the forward to whichever instance is flagged as **controller** (`trd promote <repo-name>`). The reply still appears in General, threaded under the forwarded message. Allowlist is checked against the **forwarder**, never the original sender.
+
 ### CLI commands
 
 ```bash

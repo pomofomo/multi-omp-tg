@@ -1188,22 +1188,28 @@ func (d *Dispatcher) cmdCancel(ctx context.Context, m *telegram.Message) {
 // It looks up the bound instance, builds the prompt (text + voice
 // transcript + attachment notes), and queues or immediately spawns omp.
 func (d *Dispatcher) routeToInstance(ctx context.Context, m *telegram.Message, text string) {
-	inst, err := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
+	inst, fellBackToController, err := d.resolveInstance(m.Chat.ID, m.MessageThreadID)
 	if err != nil {
-		d.logger.Warn("route: ByTopic lookup failed",
+		d.logger.Warn("route: instance lookup failed",
 			"chat", m.Chat.ID, "thread", m.MessageThreadID, "err", err)
 		return
 	}
 	if inst == nil {
-		d.logger.Debug("route: no instance bound to topic — ignoring",
+		d.logger.Debug("route: no instance bound and no controller — ignoring",
 			"chat", m.Chat.ID, "thread", m.MessageThreadID)
 		return
 	}
 	if inst.State != storage.StateRunning {
 		d.logger.Info("route: instance not running",
 			"instance", shortID(inst.InstanceID), "state", inst.State)
-		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "instance state is "+string(inst.State)+"; use /restart")
+		d.sendText(ctx, m.Chat.ID, m.MessageThreadID, "instance state is "+string(inst.State))
 		return
+	}
+	if fellBackToController {
+		d.logger.Info("route: falling back to controller",
+			"instance", shortID(inst.InstanceID),
+			"src_chat", m.Chat.ID, "src_thread", m.MessageThreadID,
+			"reason", "no instance bound to this topic; routing to controller (forwards always land in General)")
 	}
 	user := ""
 	if m.From != nil {
@@ -1626,7 +1632,7 @@ func (d *Dispatcher) handleEditedMessage(ctx context.Context, m *telegram.Messag
 	if text == "" {
 		return
 	}
-	inst, _ := d.store.ByTopic(m.Chat.ID, m.MessageThreadID)
+	inst, _, _ := d.resolveInstance(m.Chat.ID, m.MessageThreadID)
 	if inst == nil || inst.State != storage.StateRunning {
 		return
 	}
@@ -1691,6 +1697,43 @@ func (d *Dispatcher) transcribeAttachment(ctx context.Context, fileID string) st
 
 // findInstance resolves an instance by repo name or ID prefix. Same logic
 // as before; used by CancelRun.
+// resolveInstance returns the agent that should handle a message
+// arriving in (chatID, threadID), preferring the topic-bound instance
+// when one exists and falling back to the running controller instance
+// otherwise.
+//
+// fellBackToController reports whether the controller path was taken,
+// so the caller can surface that in logs and the agent can be told
+// (via the per-spawn env or system prompt) that the request originated
+// outside its topic.
+//
+// Why: Telegram's forward UI doesn't let the user pick a topic; every
+// forward lands in the supergroup's General/main thread. Without this
+// fallback those forwards reach no agent and the user sees nothing.
+// Replies still go to the originating chat/thread (the caller uses
+// m.Chat.ID / m.MessageThreadID for queuedPrompt), so the user reads
+// the answer right where they dropped the forward.
+func (d *Dispatcher) resolveInstance(chatID int64, threadID int) (*storage.Instance, bool, error) {
+	inst, err := d.store.ByTopic(chatID, threadID)
+	if err != nil {
+		return nil, false, err
+	}
+	if inst != nil {
+		return inst, false, nil
+	}
+	all, err := d.store.All()
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range all {
+		if all[i].Controller && all[i].State == storage.StateRunning {
+			ci := all[i]
+			return &ci, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
 func (d *Dispatcher) findInstance(query string) (*storage.Instance, error) {
 	all, err := d.store.All()
 	if err != nil {
